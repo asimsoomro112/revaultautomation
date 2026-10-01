@@ -65,7 +65,7 @@ const envSchema = z.object({
   MIN_GAP_MINUTES: z.coerce.number().int().positive().default(90),
   POSTING_WINDOW_START: z.string().default("12:00"),
   POSTING_WINDOW_END: z.string().default("23:00"),
-  TZ: z.string().default("Asia/Karachi"),
+  TimeZone: z.string().default("Asia/Karachi"),
   MAX_LISTINGS_PER_SELLER_PER_DAY: z.coerce.number().int().positive().default(5),
   PHOTO_DEBOUNCE_SECONDS: z.coerce.number().int().positive().default(25),
   RETENTION_DAYS: z.coerce.number().int().positive().default(30),

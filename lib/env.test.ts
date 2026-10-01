@@ -45,7 +45,7 @@ describe("getEnv defaults", () => {
     expect(env.MIN_GAP_MINUTES).toBe(90);
     expect(env.POSTING_WINDOW_START).toBe("12:00");
     expect(env.POSTING_WINDOW_END).toBe("23:00");
-    expect(env.TZ).toBe("Asia/Karachi");
+    expect(env.TimeZone).toBe("Asia/Karachi");
     expect(env.MAX_LISTINGS_PER_SELLER_PER_DAY).toBe(5);
     expect(env.PHOTO_DEBOUNCE_SECONDS).toBe(25);
     expect(env.RETENTION_DAYS).toBe(30);

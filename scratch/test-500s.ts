@@ -21,7 +21,7 @@ async function run() {
   console.log("\n--- Testing Quota ---");
   try {
     const today = new Intl.DateTimeFormat("en-CA", {
-      timeZone: getEnv().TZ,
+      timeZone: getEnv().TimeZone,
       year: "numeric",
       month: "2-digit",
       day: "2-digit",

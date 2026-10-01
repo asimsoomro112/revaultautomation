@@ -223,7 +223,7 @@ export function defaultAdminSettings(env: Env): AdminSettings {
     publish_mode: env.PUBLISH_MODE,
     max_posts_per_day: env.MAX_POSTS_PER_DAY,
     min_gap_minutes: env.MIN_GAP_MINUTES,
-    posting_window: { start: env.POSTING_WINDOW_START, end: env.POSTING_WINDOW_END, tz: env.TZ },
+    posting_window: { start: env.POSTING_WINDOW_START, end: env.POSTING_WINDOW_END, tz: env.TimeZone },
     max_listings_per_seller_per_day: env.MAX_LISTINGS_PER_SELLER_PER_DAY,
     photo_debounce_seconds: env.PHOTO_DEBOUNCE_SECONDS,
     retention_days: env.RETENTION_DAYS,
