@@ -1,0 +1,43 @@
+{
+  "dependencies": {
+    "@google/genai": "^2.24.0",
+    "@upstash/qstash": "^2.12.0",
+    "cloudinary": "^2.11.0",
+    "firebase": "^12.6.0",
+    "firebase-admin": "^14.5.0",
+    "next": "^16.3.8",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "satori": "^0.33.5",
+    "sharp": "^0.35.5",
+    "zod": "^4.6.5"
+  },
+  "description": "DM-to-Post automation bot for the Instagram professional account @therevaultofficial (ReVault preloved marketplace). Official Meta APIs only.",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^16.3.8",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^5.0.3"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "name": "revault-dm-bot",
+  "private": true,
+  "scripts": {
+    "build": "next build",
+    "dev": "next dev",
+    "grant-admin": "tsx scripts/grant-admin.ts",
+    "lint": "eslint . --max-warnings=0",
+    "replay-webhook": "tsx scripts/replay-webhook.ts",
+    "start": "next start",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "version": "0.1.0"
+}
