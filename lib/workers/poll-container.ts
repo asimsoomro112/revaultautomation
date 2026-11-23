@@ -442,6 +442,28 @@ async function finalizePublished(
     const doneLink = fresh.publish.permalink ?? permalink;
     return doneLink ? { outcome: "already-published", permalink: doneLink } : { outcome: "already-published" };
   }
+  // A concurrent worker failed (or rejected) the listing while this delivery
+  // was between media_publish and finalize: the media IS live on IG, but
+  // marking it PUBLISHED would flip the failure, bump the counter, and send
+  // the seller a "Mubarak" DM contradicting the failure DM already sent.
+  // Do not finalize; alert an admin instead — the live post needs a
+  // human/delete flow (2026-11-24 re-audit Lane A NEW-1). Check the passed
+  // listing too: the publishNow claim-fail branch passes its own fresh read,
+  // which can be terminal while this re-read sees an older snapshot.
+  if (isTerminalStatus(fresh.status) || isTerminalStatus(listing.status)) {
+    const terminalStatus = isTerminalStatus(fresh.status) ? fresh.status : listing.status;
+    log.warn("poll worker: media published but listing is terminal, not finalizing", {
+      listing_id: listingId,
+      status: terminalStatus,
+      media_id: mediaId,
+    });
+    await deps.notify(
+      `⚠️ Media ${mediaId} went live on Instagram but listing ${listingId} is ${terminalStatus} — NOT marked PUBLISHED; needs a human (check / delete the post)`,
+      { listingId },
+    );
+    await deps.appendEvent(listingId, "published_terminal", { media_id: mediaId, status: terminalStatus });
+    return { outcome: "terminal" };
+  }
   let link = permalink;
   if (!link) {
     link = await deps.getMeta().getPermalink(mediaId);

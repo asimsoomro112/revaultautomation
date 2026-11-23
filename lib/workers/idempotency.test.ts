@@ -725,4 +725,49 @@ describe("terminal-status guards — rejected/failed listings never resurrect (r
     expect(state.postsToday).toBe(1);
     expect(state.dms).toHaveLength(1);
   });
+
+  it("finalizePublished does NOT flip a FAILED listing to PUBLISHED (media live, needs a human)", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    const listing = state.listings.get("lst1")!;
+    listing.status = "PUBLISHING";
+    listing.publish.media_id = "media_1";
+    listing.publish.permalink = null;
+    listing.publish.locked_until = null;
+    listing.publish.container_ids = ["child_0"];
+    listing.publish.container_status = { child_0: "FINISHED" };
+    // A concurrent worker failed the listing between this poll's entry read
+    // and finalizePublished's re-read: the 2nd getListing call sees FAILED.
+    let calls = 0;
+    const origGet = deps.getListing;
+    deps.getListing = async (id) => {
+      const doc = await origGet(id);
+      calls++;
+      if (calls === 2 && doc) return { ...doc, status: "FAILED" as const };
+      return doc;
+    };
+    const r = await handlePollContainer(pollPayload("child_0"), deps);
+    expect(r.outcome).toBe("terminal");
+    // The stored doc was PUBLISHING (the FAILED status exists only in the
+    // mocked re-read) — the point is it was NOT flipped to PUBLISHED.
+    expect(state.listings.get("lst1")!.status).toBe("PUBLISHING");
+    expect(state.postsToday).toBe(0); // counter not bumped
+    expect(state.dms).toHaveLength(0); // no "Mubarak" DM contradicting the failure DM
+    expect(state.notifications.length).toBeGreaterThan(0); // admin alerted: media is live
+  });
+
+  it("publish recovery does NOT flip a FAILED listing to PUBLISHED", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    const listing = state.listings.get("lst1")!;
+    listing.status = "FAILED";
+    listing.publish.media_id = "media_1";
+    listing.publish.permalink = null;
+    const r = await handlePublish("lst1", deps);
+    expect(r.outcome).toBe("terminal");
+    expect(state.listings.get("lst1")!.status).toBe("FAILED");
+    expect(state.postsToday).toBe(0);
+    expect(state.dms).toHaveLength(0);
+    expect(state.notifications.length).toBeGreaterThan(0);
+  });
 });

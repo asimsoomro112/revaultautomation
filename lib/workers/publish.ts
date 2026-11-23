@@ -26,6 +26,7 @@ import { log } from "@/lib/log";
 import { MetaApiError } from "@/lib/meta";
 import {
   failListing,
+  isTerminalStatus,
   liveSettings,
   parkForKillSwitch,
   KillSwitchEngaged,
@@ -37,6 +38,7 @@ export interface PublishOutcome {
   outcome:
     | "missing"
     | "already-published"
+    | "terminal"
     | "recovered"
     | "recover-failed"
     | "not-claimed"
@@ -87,7 +89,27 @@ export async function handlePublish(
   }
   if (pre.publish.media_id && !pre.publish.permalink) {
     // Crashed between media_publish and the PUBLISHED write — recover without
-    // calling media_publish again (double-post guard).
+    // calling media_publish again (double-post guard). BUT: if the listing
+    // was failed/rejected meanwhile (a concurrent worker, or reconcile),
+    // do NOT resurrect it to PUBLISHED — the failure DM already went out.
+    // Alert an admin instead; the live post needs a human/delete flow
+    // (same gap as finalizePublished, 2026-11-24 re-audit Lane A NEW-1).
+    if (isTerminalStatus(pre.status)) {
+      log.warn("publish worker: media live but listing is terminal, not recovering to PUBLISHED", {
+        listing_id: listingId,
+        status: pre.status,
+        media_id: pre.publish.media_id,
+      });
+      await deps.notify(
+        `⚠️ Media ${pre.publish.media_id} went live on Instagram but listing ${listingId} is ${pre.status} — NOT marked PUBLISHED; needs a human (check / delete the post)`,
+        { listingId },
+      );
+      await deps.appendEvent(listingId, "published_terminal", {
+        media_id: pre.publish.media_id,
+        status: pre.status,
+      });
+      return { outcome: "terminal" };
+    }
     try {
       const permalink = await deps.getMeta().getPermalink(pre.publish.media_id);
       await deps.saveListing(listingId, {
