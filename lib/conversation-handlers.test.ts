@@ -383,6 +383,47 @@ describe("handleMessage: consent", () => {
     expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
   });
 
+  it("consent:edit → typed caption is kept (not regenerated) + preview shows it", async () => {
+    await seedConfirm();
+    await handleMessage(
+      payload("mid_9"),
+      makeInbound("quick_reply", "mid_9", { quick_reply_payload: "consent:edit", text: "Edit" }),
+      deps,
+    );
+    await handleMessage(
+      payload("mid_10"),
+      makeInbound("text", "mid_10", { text: "My preloved Zara dress, barely worn!" }),
+      deps,
+    );
+    const listing = deps.fdb.listings.get("lst_1")!;
+    expect(listing.caption).toBe("My preloved Zara dress, barely worn!");
+    expect(listing.status).toBe("CONFIRM");
+    expect(deps.fdb.convos.get(IGSID)!.state).toBe("CONFIRM");
+    const sent = deps.meta.sent[deps.meta.sent.length - 1]!;
+    expect(sent.opts.text).toContain("My preloved Zara dress, barely worn!");
+    expect(sent.opts.quickReplies!.map((q) => q.payload)).toEqual(
+      expect.arrayContaining(["consent:post", "consent:cancel"]),
+    );
+  });
+
+  it("caption containing a 'Key: value' line is kept verbatim (not parsed as a field dump)", async () => {
+    await seedConfirm();
+    await handleMessage(
+      payload("mid_9"),
+      makeInbound("quick_reply", "mid_9", { quick_reply_payload: "consent:edit", text: "Edit" }),
+      deps,
+    );
+    await handleMessage(
+      payload("mid_10"),
+      makeInbound("text", "mid_10", { text: "My Zara dress, barely worn!\nPrice: 1500 is a steal" }),
+      deps,
+    );
+    const listing = deps.fdb.listings.get("lst_1")!;
+    expect(listing.caption).toBe("My Zara dress, barely worn!\nPrice: 1500 is a steal");
+    expect(listing.extracted!.price_pkr).toBe(2500); // not overwritten by the "Price:" line
+    expect(listing.status).toBe("CONFIRM");
+  });
+
   it("CONFIRM + stray text → nudge with consent buttons (no state change)", async () => {
     await seedConfirm();
     await handleMessage(payload("mid_9"), makeInbound("text", "mid_9", { text: "hmm" }), deps);

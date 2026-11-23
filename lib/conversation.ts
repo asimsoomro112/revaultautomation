@@ -492,6 +492,43 @@ export async function sendSafe(
   }
 }
 
+/**
+ * Confirm with the seller's own caption (consent:edit flow). moveToConfirm
+ * regenerates the caption from `extracted` via buildCaption — using it here
+ * would discard the edit the seller just typed. The caption was already
+ * saved by handleInfoAnswer's mutate; only the status transition + preview
+ * remain. The preview shows the seller's caption, so they can re-edit if
+ * it is not what they meant.
+ */
+async function confirmWithSellerCaption(
+  deps: Deps,
+  convo: ConversationDoc,
+  listing: ListingDoc,
+): Promise<void> {
+  if (!listing.extracted) throw new Error("confirmWithSellerCaption: listing has no extracted data");
+  if (!listing.caption) throw new Error("confirmWithSellerCaption: listing has no caption");
+  // Narrow patch, not a full-doc save (see moveToConfirm).
+  await deps.db.saveListing(listing.id, { status: "CONFIRM" });
+  listing.status = "CONFIRM";
+  await deps.db.appendListingEvent(listing.id, { type: "confirm", caption_chars: listing.caption.length });
+  setConversationState(convo, "CONFIRM");
+  await persistConvo(deps, convo);
+  const preview = confirmPreviewText(listing.extracted, listing.caption, convo.lang);
+  await sendSafe(deps, convo, {
+    text: `${preview}\n\n${consentText(convo.lang)}`,
+    quickReplies: consentQuickReplies(),
+  });
+}
+
+/** Pending-question source: the stored missing list wins — readyForConfirm
+ * never lists "caption" (it is generated, not extracted), so the edit
+ * flow's ["caption"] would otherwise resolve to the "category" fallback
+ * and the seller's answer would land on the wrong field. */
+function pendingMissing(listing: ListingDoc): string[] {
+  const stored = listing.missing ?? [];
+  return stored.length > 0 ? stored : readyForConfirm(listing).missing;
+}
+
 // ---------------------------------------------------------------------------
 // Shared: move a complete listing to CONFIRM (message worker + finalize worker)
 // ---------------------------------------------------------------------------
@@ -755,12 +792,16 @@ async function handleText(deps: Deps, convo: ConversationDoc, text: string, nowI
       }
       // A multi-line details dump answers several fields at once — parse
       // every recognizable field out of it before falling back to the
-      // single pending-question answer.
-      const dump = parseDetailsDump(text);
-      if (dump.length > 0 && (await applyDetailsDump(deps, convo, listing, text, dump))) break;
+      // single pending-question answer. NOT when the pending question is the
+      // caption edit: a caption containing a "Key: value" line must be kept
+      // verbatim, not parsed as field updates.
+      const pending = nextQuestion(pendingMissing(listing), convo.lang, listing.photos.length);
+      if (pending.field !== "caption") {
+        const dump = parseDetailsDump(text);
+        if (dump.length > 0 && (await applyDetailsDump(deps, convo, listing, text, dump))) break;
+      }
       // Typed answer to the pending question. Quick-reply taps arrive as
       // quick_reply kind; typed text may match a numbered/word fallback.
-      const pending = nextQuestion(readyForConfirm(listing).missing, convo.lang, listing.photos.length);
       const matched = pending.quickReplies ? matchTypedAnswer(text, pending.quickReplies) : null;
       await handleInfoAnswer(deps, convo, listing, pending.field, matched ?? text);
       break;
@@ -879,9 +920,8 @@ async function handleInfoAnswer(
     return;
   }
   const coerced = coerceFieldValue(field, rawValue);
-  const check = readyForConfirm(listing);
   if (!coerced.ok) {
-    const q = nextQuestion(check.missing, convo.lang, listing.photos.length);
+    const q = nextQuestion(pendingMissing(listing), convo.lang, listing.photos.length);
     await persistConvo(deps, convo);
     await sendSafe(deps, convo, sendOpts(clarifyRetry(convo.lang, q.question), q.quickReplies));
     return;
@@ -902,7 +942,13 @@ async function handleInfoAnswer(
   });
   const after = readyForConfirm(updated);
   if (after.ok) {
-    await moveToConfirm(deps, convo, updated);
+    // A caption edit must keep the seller's words: moveToConfirm would
+    // regenerate the caption from `extracted` and discard the edit.
+    if (field === "caption") {
+      await confirmWithSellerCaption(deps, convo, updated);
+    } else {
+      await moveToConfirm(deps, convo, updated);
+    }
   } else {
     await deps.db.saveListing(listing.id, { status: "NEEDS_INFO", missing: after.missing });
     setConversationState(convo, "NEEDS_INFO");
