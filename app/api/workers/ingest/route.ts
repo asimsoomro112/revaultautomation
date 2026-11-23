@@ -55,6 +55,7 @@ export async function POST(req: Request): Promise<Response> {
       getOrCreateActiveListing,
       enqueue: (route, payload, opts) => enqueueWorker(route, payload, opts),
       getPhotoDebounceSeconds: () => getEnv().PHOTO_DEBOUNCE_SECONDS,
+      getMaxListingsPerSellerPerDay: () => getEnv().MAX_LISTINGS_PER_SELLER_PER_DAY,
       saveInbound: saveInboundMessage,
     });
     return NextResponse.json({ ok: true, ...result });

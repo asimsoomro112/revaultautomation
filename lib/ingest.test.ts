@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { processIngest, type EnqueueFn, type IngestDeps } from "./ingest";
-import { blankListingDoc } from "./db";
+import { blankListingDoc, pktDay } from "./db";
 import { blankTestConversation, makeKeyedMutex } from "./test-fakes";
 import type {
   ConversationDoc,
@@ -39,17 +39,20 @@ function makeInbound(kind: NormalizedInbound["kind"], mid: string, extra: Partia
   };
 }
 
-function makeDeps(): {
+function makeDeps(opts: { maxPerDay?: number } = {}): {
   deps: IngestDeps;
   enqueued: Enqueued[];
   downloads: { url: string; dest: string }[];
   listings: Map<string, ListingDoc>;
   convs: Map<string, ConversationDoc>;
+  savedInbounds: NormalizedInbound[];
 } {
   const listings = new Map<string, ListingDoc>();
   const convs = new Map<string, ConversationDoc>();
   const enqueued: Enqueued[] = [];
   const downloads: { url: string; dest: string }[] = [];
+  const savedInbounds: NormalizedInbound[] = [];
+  const maxPerDay = opts.maxPerDay ?? 5;
   let idSeq = 0;
   // Same serialization the real Firestore transactions provide, so burst
   // tests exercise the same interleaving production sees.
@@ -78,7 +81,7 @@ function makeDeps(): {
         Object.assign(doc, patch);
         return result;
       }),
-    getOrCreateActiveListing: async (igsid, nowIso) =>
+    getOrCreateActiveListing: async (igsid, nowIso, maxPerDayArg) =>
       locks(`conv:${igsid}`, async () => {
         const convoSnap = convs.get(igsid);
         const convo = convoSnap ? structuredClone(convoSnap) : null;
@@ -88,6 +91,14 @@ function makeDeps(): {
             return { listing: existing, isNew: false };
           }
         }
+        // Mirror prod (lib/db.ts): daily limit enforced in the create
+        // transaction; a reuse above never consumes a slot.
+        const today = pktDay(new Date(nowIso));
+        const effectiveToday = convo && convo.listings_day === today ? convo.listings_today : 0;
+        const cap = maxPerDayArg ?? maxPerDay;
+        if (effectiveToday >= cap) {
+          return { listing: null, isNew: false, limitReached: true };
+        }
         const id = ++idSeq === 1 ? "lst_test123" : `lst_test${idSeq}`;
         const doc = blankListingDoc(id, igsid, nowIso);
         listings.set(id, doc);
@@ -96,16 +107,22 @@ function makeDeps(): {
         c.state = "COLLECTING";
         c.last_user_msg_at = nowIso;
         c.window_open = true;
+        c.listings_today = effectiveToday + 1;
+        c.listings_day = today;
         convs.set(igsid, c);
-        return { listing: doc, isNew: true };
+        return { listing: doc, isNew: true, listingsToday: effectiveToday + 1, listingsDay: today };
       }),
     enqueue: (async (route, payload, opts) => {
       enqueued.push({ route, payload, opts });
     }) as EnqueueFn,
     getPhotoDebounceSeconds: () => 25,
+    getMaxListingsPerSellerPerDay: () => maxPerDay,
+    saveInbound: async (inbound) => {
+      savedInbounds.push(inbound);
+    },
     nowIso: () => NOW,
   };
-  return { deps, enqueued, downloads, listings, convs };
+  return { deps, enqueued, downloads, listings, convs, savedInbounds };
 }
 
 describe("processIngest — image", () => {
@@ -293,6 +310,45 @@ describe("processIngest — image", () => {
     expect(res.action).toBe("enqueued-message");
     expect(downloads).toHaveLength(0);
     expect(enqueued[0]?.route).toBe("message");
+  });
+
+  it("photo-first at the daily limit → limit-reached, no download, limit reply enqueued", async () => {
+    const { deps, enqueued, downloads, listings, convs, savedInbounds } = makeDeps({ maxPerDay: 1 });
+    convs.set(IGSID, { ...blankTestConversation(IGSID), listings_today: 1, listings_day: "2026-09-30" });
+    const res = await processIngest(
+      { kind: "ingest", message: makeInbound("image", "m_img1", { image_url: "https://cdn.example/a.jpg" }) },
+      deps,
+    );
+    expect(res.action).toBe("limit-reached");
+    expect(res.listingId).toBeUndefined();
+    expect(downloads).toHaveLength(0); // photo never downloaded
+    expect(listings.size).toBe(0); // no listing created
+    expect(enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(0);
+    expect(savedInbounds).toHaveLength(1); // message route needs the inbound to send the reply
+    const msg = enqueued.filter((e) => e.route === "message");
+    expect(msg).toHaveLength(1);
+    expect(msg[0]?.payload).toMatchObject({ kind: "message", igsid: IGSID, mid: "m_img1", limit_reply: true });
+  });
+
+  it("photo-first counts the new listing; a second listing the same day is blocked but reuse is not", async () => {
+    const { deps, enqueued, downloads, listings, convs } = makeDeps({ maxPerDay: 1 });
+    const photo = (mid: string, url: string) =>
+      processIngest({ kind: "ingest", message: makeInbound("image", mid, { image_url: url }) }, deps);
+
+    // First photo creates listing #1 and consumes the day's only slot.
+    expect((await photo("m_img1", "https://cdn.example/a.jpg")).action).toBe("photo-saved");
+    expect(convs.get(IGSID)?.listings_today).toBe(1);
+    // Second photo reuses the same active listing — no new slot consumed.
+    expect((await photo("m_img2", "https://cdn.example/b.jpg")).action).toBe("photo-saved");
+    expect(convs.get(IGSID)?.listings_today).toBe(1);
+    expect(listings.get("lst_test123")?.photos).toHaveLength(2);
+    // Once listing #1 is submitted, a new photo would start listing #2 —
+    // over the limit, so it is dropped.
+    listings.get("lst_test123")!.status = "SUBMITTED";
+    expect((await photo("m_img3", "https://cdn.example/c.jpg")).action).toBe("limit-reached");
+    expect(downloads).toHaveLength(2); // only the first two photos downloaded
+    expect(listings.size).toBe(1);
+    expect(enqueued.filter((e) => e.route === "message" && e.payload.kind === "message" && e.payload.limit_reply)).toHaveLength(1);
   });
 });
 

@@ -198,6 +198,13 @@ export interface MessagePayload {
   kind: "message";
   igsid: string;
   mid: string;
+  /**
+   * Ingest sets this when a photo-first seller is over the daily listing
+   * limit: the photo was dropped (no listing created) and the message worker
+   * should send the polite limit reply instead of routing the image inbound
+   * (which it otherwise ignores).
+   */
+  limit_reply?: boolean | undefined;
 }
 export interface FinalizePhotosPayload {
   kind: "finalize-photos";

@@ -109,6 +109,20 @@ describe("handleMessage: IDLE routing", () => {
     expect(convo.listings_day).toBe("2026-09-30");
     expect(convo.listings_today).toBe(1); // reset to 0, then +1 for the new listing
   });
+
+  it("limit_reply payload (photo-first seller over the limit) → polite limit reply, no listing", async () => {
+    deps.maxListingsPerSellerPerDay = 1;
+    const convo0 = await deps.db.getOrCreateConversation(IGSID);
+    convo0.listings_today = 1;
+    await handleMessage(
+      { kind: "message", igsid: IGSID, mid: "mid_lim", limit_reply: true },
+      makeInbound("image", "mid_lim", { image_url: "https://cdn.example/a.jpg" }),
+      deps,
+    );
+    expect(deps.fdb.convos.get(IGSID)!.active_listing_id).toBeNull();
+    expect(deps.meta.sent).toHaveLength(1);
+    expect(deps.meta.sent[0]!.opts.text).toMatch(/limit|kal/i);
+  });
 });
 
 describe("handleMessage: guards", () => {

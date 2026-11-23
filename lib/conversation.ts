@@ -47,7 +47,6 @@ import {
   unsupportedReply,
 } from "./prompts";
 import { log, redactPII } from "./log";
-import { pktDay } from "./db";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -415,9 +414,22 @@ export interface DbPort {
   ) => Promise<T>;
   /**
    * Transactional find-or-create of the sender's active DRAFT/NEEDS_INFO
-   * listing (see lib/db.ts getOrCreateActiveListing).
+   * listing (see lib/db.ts getOrCreateActiveListing). The daily limit is
+   * enforced inside that transaction (maxPerDay): when the seller is over
+   * the limit and no active listing exists, it returns
+   * { listing: null, limitReached: true } and creates nothing.
    */
-  getOrCreateActiveListing: (igsid: string, nowIso: string) => Promise<{ listing: ListingDoc; isNew: boolean }>;
+  getOrCreateActiveListing: (
+    igsid: string,
+    nowIso: string,
+    maxPerDay?: number,
+  ) => Promise<{
+    listing: ListingDoc | null;
+    isNew: boolean;
+    limitReached?: boolean;
+    listingsToday?: number;
+    listingsDay?: string;
+  }>;
   createListing(doc: ListingDoc): Promise<void>;
   appendListingEvent(listingId: string, event: { type: string; at?: string; [k: string]: unknown }): Promise<void>;
   getAdminSettings(): Promise<AdminSettings>;
@@ -663,20 +675,25 @@ export async function ensureActiveListing(
     }
     convo.active_listing_id = null; // stale pointer (submitted/rejected/…)
   }
-  // Daily limit rolls over at midnight PKT: listings_day tracks the day the
-  // counter belongs to. Without this reset, listings_today was a lifetime
-  // counter — a seller who ever hit the limit was locked out forever.
-  const today = pktDay(new Date(nowIso));
-  if (convo.listings_day !== today) {
-    convo.listings_today = 0;
-    convo.listings_day = today;
-  }
-  if (convo.listings_today >= deps.maxListingsPerSellerPerDay) return { listing: null, isNew: false };
-  const { listing, isNew } = await deps.db.getOrCreateActiveListing(convo.igsid, nowIso);
+  // The daily limit (incl. the midnight-PKT rollover) is enforced atomically
+  // inside getOrCreateActiveListing's transaction — it used to live here,
+  // which left the photo-first path unenforced: ingest called getOrCreate
+  // directly and never touched listings_today, so a photo-first seller could
+  // submit unlimited listings (2026-11-24 re-audit Lane C N-H1).
+  const { listing, isNew, listingsToday, listingsDay } = await deps.db.getOrCreateActiveListing(
+    convo.igsid,
+    nowIso,
+    deps.maxListingsPerSellerPerDay,
+  );
+  if (!listing) return { listing: null, isNew: false }; // limit reached — caller sends the limit reply
   convo.active_listing_id = listing.id;
   convo.intent = "SELLER_SUBMIT";
   if (isNew) {
-    convo.listings_today += 1;
+    // Keep the in-memory convo consistent with the transaction's counter
+    // bump — the caller full-saves this doc afterwards, and a stale value
+    // here would clobber the bump.
+    if (listingsToday !== undefined) convo.listings_today = listingsToday;
+    if (listingsDay !== undefined) convo.listings_day = listingsDay;
     await deps.db.appendListingEvent(listing.id, { type: "created", source: "dm" });
   }
   if (convo.state === "IDLE") setConversationState(convo, "COLLECTING");
@@ -748,6 +765,15 @@ export async function handleMessage(
   await persistConvo(deps, convo);
 
   try {
+    // Daily-limit reply for a photo-first seller: ingest enforces the limit
+    // atomically in getOrCreateActiveListing and, when the seller is over
+    // the limit, enqueues the message worker with limit_reply so the seller
+    // hears why their photo was dropped (the message worker otherwise
+    // ignores image inbounds entirely).
+    if (payload.limit_reply) {
+      await sendSafe(deps, convo, { text: listingLimitReply(convo.lang, deps.maxListingsPerSellerPerDay) });
+      return { ok: true };
+    }
     // --- human handoff keyword: flag + holding reply ONCE per flag ---
     if (text && isHumanKeyword(text)) {
       if (!convo.human_needed) {

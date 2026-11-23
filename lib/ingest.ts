@@ -58,6 +58,7 @@ const messagePayloadSchema = z.object({
   kind: z.literal("message"),
   igsid: z.string(),
   mid: z.string(),
+  limit_reply: z.boolean().optional(),
 });
 
 const finalizePhotosPayloadSchema = z.object({
@@ -117,9 +118,21 @@ export interface IngestDeps {
    * listing (see lib/db.ts getOrCreateActiveListing). Concurrent first
    * photos must not each create their own listing.
    */
-  getOrCreateActiveListing: (igsid: string, nowIso: string) => Promise<{ listing: ListingDoc; isNew: boolean }>;
+  getOrCreateActiveListing: (
+    igsid: string,
+    nowIso: string,
+    maxPerDay?: number,
+  ) => Promise<{
+    listing: ListingDoc | null;
+    isNew: boolean;
+    limitReached?: boolean;
+    listingsToday?: number;
+    listingsDay?: string;
+  }>;
   enqueue: EnqueueFn;
   getPhotoDebounceSeconds: () => number;
+  /** Daily listing cap (env MAX_LISTINGS_PER_SELLER_PER_DAY, same source as the message worker). */
+  getMaxListingsPerSellerPerDay: () => number;
   nowIso?: () => string;
   /**
    * Phase 2: persist the NormalizedInbound so the message worker can load it
@@ -131,7 +144,7 @@ export interface IngestDeps {
 }
 
 export interface IngestResult {
-  action: "photo-saved" | "photo-retry" | "enqueued-message" | "ignored";
+  action: "photo-saved" | "photo-retry" | "enqueued-message" | "ignored" | "limit-reached";
   listingId?: string;
 }
 
@@ -158,8 +171,20 @@ async function handleImage(
   // Reuse the sender's active DRAFT *or NEEDS_INFO* listing; otherwise start
   // a new one — atomically (see getOrCreateActiveListing). NEEDS_INFO matters:
   // when the bot asked for a missing photo, the seller's next photo must land
-  // on the SAME listing, not spawn a second one.
-  const { listing } = await deps.getOrCreateActiveListing(igsid, now);
+  // on the SAME listing, not spawn a second one. The daily limit is enforced
+  // inside that transaction: a photo-first seller over the limit gets NO new
+  // listing (null + limitReached) — the photo is dropped, never downloaded,
+  // and the message worker sends the polite limit reply so the seller hears
+  // why. Reusing an existing active listing never consumes a slot.
+  const { listing } = await deps.getOrCreateActiveListing(igsid, now, deps.getMaxListingsPerSellerPerDay());
+  if (!listing) {
+    log.info("ingest: daily listing limit reached — photo dropped, limit reply enqueued", { mid: message.mid });
+    // Persist the inbound first: the message route skips payloads whose
+    // inbound is missing, so without this the limit reply would never send.
+    if (deps.saveInbound) await deps.saveInbound(message);
+    await deps.enqueue("message", { kind: "message", igsid, mid: message.mid, limit_reply: true });
+    return { action: "limit-reached" };
+  }
   const listingId = listing.id;
 
   // Download bytes NOW — Meta CDN URLs expire, so this cannot wait. The

@@ -2,7 +2,7 @@
  * Shared in-memory fakes for Phase 2 unit tests (conversation + finalize).
  * Not a test file itself — vitest only collects *.test.ts.
  */
-import { blankListingDoc } from "./db";
+import { blankListingDoc, pktDay } from "./db";
 import type { Deps } from "./conversation";
 import type { FinalizeDeps } from "./finalize";
 import type { GeminiClient, IntentResult, VisionResult } from "./gemini";
@@ -300,7 +300,7 @@ export function makeFakeDeps(overrides: Partial<FakeDb> = {}): FakeDeps {
           Object.assign(doc, patch);
           return result;
         }),
-      getOrCreateActiveListing: async (igsid, nowIso) =>
+      getOrCreateActiveListing: async (igsid, nowIso, maxPerDay) =>
         locks(`conv:${igsid}`, async () => {
           const convoSnap = fdb.convos.get(igsid);
           const convo = convoSnap ? structuredClone(convoSnap) : null;
@@ -310,6 +310,14 @@ export function makeFakeDeps(overrides: Partial<FakeDb> = {}): FakeDeps {
               return { listing: existing, isNew: false };
             }
           }
+          // Mirror prod (lib/db.ts): the daily limit is enforced here, in
+          // the same transaction as the create — a reuse above never
+          // consumes a slot.
+          const today = pktDay(new Date(nowIso));
+          const effectiveToday = convo && convo.listings_day === today ? convo.listings_today : 0;
+          if (maxPerDay !== undefined && effectiveToday >= maxPerDay) {
+            return { listing: null, isNew: false, limitReached: true };
+          }
           const doc = blankListingDoc(`lst_test_${++idSeq}`, igsid, nowIso);
           fdb.listings.set(doc.id, doc);
           const c = convo ?? blankTestConversation(igsid);
@@ -317,8 +325,10 @@ export function makeFakeDeps(overrides: Partial<FakeDb> = {}): FakeDeps {
           c.state = "COLLECTING";
           c.last_user_msg_at = nowIso;
           c.window_open = true;
+          c.listings_today = effectiveToday + 1;
+          c.listings_day = today;
           fdb.convos.set(igsid, c);
-          return { listing: doc, isNew: true };
+          return { listing: doc, isNew: true, listingsToday: effectiveToday + 1, listingsDay: today };
         }),
       createListing: async (doc: ListingDoc) => {
         fdb.listings.set(doc.id, doc);

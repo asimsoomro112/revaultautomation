@@ -223,15 +223,35 @@ export async function mutateListing<T>(
  * WHY: same burst race as mutateListing — two concurrent first-photos both
  * saw `active_listing_id === null` and each created its own listing, splitting
  * one seller's photos across two listings. The transaction claims the pointer
- * (or the fresh listing) exactly once. Returns the listing + whether it was
- * just created (callers only bump listings_today on a real create).
+ * (or the fresh listing) exactly once.
+ *
+ * DAILY LIMIT (2026-11-24 re-audit Lane C N-H1): the limit used to be
+ * enforced only by the message worker's ensureActiveListing, so photo-first
+ * sellers (the normal flow) never incremented listings_today and could
+ * submit unlimited listings. The counter now lives HERE, in the same
+ * transaction as the create: when maxPerDay is given, a new listing is
+ * created only when the seller's effective count for today (listings_day
+ * rolls over at midnight PKT) is below it, and the create bumps the counter
+ * in the same transaction — no check-then-create race, and reusing an
+ * existing active listing never consumes a slot. Callers pass the limit and
+ * map { listing: null, limitReached: true } to the polite limit reply. The
+ * returned listingsToday/listingsDay let callers keep their in-memory convo
+ * consistent (the message worker full-saves the convo afterwards).
  */
 export async function getOrCreateActiveListing(
   igsid: string,
   nowIso: string,
-): Promise<{ listing: ListingDoc; isNew: boolean }> {
+  maxPerDay?: number,
+): Promise<{
+  listing: ListingDoc | null;
+  isNew: boolean;
+  limitReached?: boolean;
+  listingsToday?: number;
+  listingsDay?: string;
+}> {
   const convRef = col("conversations").doc(igsid);
   const listingId = newListingId();
+  const today = pktDay(new Date(nowIso));
   return db().runTransaction(async (tx) => {
     const convSnap = await tx.get(convRef);
     const convo = convSnap.exists ? (convSnap.data() as ConversationDoc) : null;
@@ -242,12 +262,19 @@ export async function getOrCreateActiveListing(
         return { listing: existing, isNew: false };
       }
     }
+    // No reusable listing: a new one would be created — enforce the daily
+    // limit first (a reuse above never consumes a slot).
+    const effectiveToday = convo && convo.listings_day === today ? convo.listings_today : 0;
+    if (maxPerDay !== undefined && effectiveToday >= maxPerDay) {
+      return { listing: null, isNew: false, limitReached: true };
+    }
     const doc = blankListingDoc(listingId, igsid, nowIso);
     tx.set(col("listings").doc(listingId), doc);
+    const counterPatch = { listings_today: effectiveToday + 1, listings_day: today };
     if (convo) {
       tx.set(
         convRef,
-        { active_listing_id: listingId, state: "COLLECTING", last_user_msg_at: nowIso, window_open: true },
+        { active_listing_id: listingId, state: "COLLECTING", last_user_msg_at: nowIso, window_open: true, ...counterPatch },
         { merge: true },
       );
     } else {
@@ -257,9 +284,10 @@ export async function getOrCreateActiveListing(
         active_listing_id: listingId,
         last_user_msg_at: nowIso,
         window_open: true,
+        ...counterPatch,
       });
     }
-    return { listing: doc, isNew: true };
+    return { listing: doc, isNew: true, listingsToday: effectiveToday + 1, listingsDay: today };
   });
 }
 
