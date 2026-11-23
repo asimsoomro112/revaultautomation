@@ -8,7 +8,7 @@
  * - parseWebhookPayload: zod-validate Meta's {object:'instagram', entry[].messaging[]}
  *   shape into NormalizedInbound[].
  */
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 import type { InboundKind, NormalizedInbound } from "./types";
 
@@ -170,4 +170,27 @@ export function parseWebhookPayload(json: unknown): NormalizedInbound[] {
 /** Narrow a NormalizedInbound list to non-echo items (convenience for callers). */
 export function nonEcho(inbounds: NormalizedInbound[]): NormalizedInbound[] {
   return inbounds.filter((m): m is NormalizedInbound & { kind: Exclude<InboundKind, "echo"> } => m.kind !== "echo");
+}
+
+/**
+ * QStash deduplication id (and processed_webhooks claim key) for one inbound.
+ *
+ * One message carrying N image attachments fans out to N inbounds that ALL
+ * share one `mid` (see parseMessage). Keying the dedup id on the bare mid
+ * made QStash deliver only the first ingest — photos 2+ were silently
+ * dropped with no error anywhere (2026-11-23 photo-loss repros,
+ * finalized photo_count=1). So image inbounds are keyed per-attachment:
+ * mid + a 16-hex-char SHA-256 of the CDN URL. The URL hash keeps the id
+ * short (QStash sanitizes `:` etc. anyway) and stable, so a genuine
+ * redelivery of the same photo still dedups — and two different photos in
+ * one message never collide. Non-image inbounds are one per message, so
+ * the bare mid stays their key. Ingest is idempotent on storage_path, so
+ * even a hash collision would only re-deliver an already-saved photo.
+ */
+export function inboundDedupId(inbound: NormalizedInbound): string {
+  if (inbound.kind === "image" && inbound.image_url) {
+    const hash = createHash("sha256").update(inbound.image_url).digest("hex").slice(0, 16);
+    return `${inbound.mid}-${hash}`;
+  }
+  return inbound.mid;
 }

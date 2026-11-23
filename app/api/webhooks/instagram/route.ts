@@ -9,14 +9,16 @@
  *   2. Verify X-Hub-Signature-256 (timing-safe). Fail → 401 + log, no PII.
  *   3. Parse + flatten entry[].messaging[] into NormalizedInbound[].
  *   4. Per message: skip echoes; enqueue the ingest worker (deduplicationId =
- *      mid, so QStash itself suppresses duplicate deliveries); claim the mid
- *      in processed_webhooks (transaction → concurrent deliveries dedupe).
+ *      inboundDedupId — per-attachment for images, so one message carrying N
+ *      photos enqueues N ingests instead of QStash suppressing all but the
+ *      first as duplicates of the shared mid); claim the same id in
+ *      processed_webhooks (transaction → concurrent deliveries dedupe).
  *   5. Return 200 {ok:true} fast (target <800ms). Internal errors → 500 so
  *      Meta retries; the claim/enqueue pair is idempotent on redelivery.
  *
  * Ordering note (deliberate): enqueue happens BEFORE the Firestore claim.
  * If we claimed first and the enqueue then failed, the 500 → Meta retry path
- * would find the mid already claimed and drop the message. Enqueue-first with
+ * would find the dedup id already claimed and drop the message. Enqueue-first with
  * deduplicationId is strictly safer: a crash between the two steps is healed
  * by redelivery, and duplicates are suppressed by both the dedup id and the
  * transaction.
@@ -26,7 +28,7 @@ import { requireWebhookEnv } from "@/lib/env";
 import { log } from "@/lib/log";
 import { claimWebhookMid } from "@/lib/db";
 import { enqueueWorker } from "@/lib/qstash";
-import { parseWebhookPayload, verifyGetChallenge, verifySignature } from "@/lib/webhook";
+import { inboundDedupId, parseWebhookPayload, verifyGetChallenge, verifySignature } from "@/lib/webhook";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
@@ -78,9 +80,13 @@ export async function POST(req: Request): Promise<Response> {
     await Promise.all(
       messages.map(async (message) => {
         if (message.kind === "echo") return;
-        // Enqueue first (see ordering note above), then claim the mid.
-        await enqueueWorker("ingest", { kind: "ingest", message }, { deduplicationId: message.mid });
-        await claimWebhookMid(message.mid);
+        // Enqueue first (see ordering note above), then claim the dedup id.
+        // Per-attachment dedup: a multi-photo message fans out to N inbounds
+        // sharing one mid — the bare mid as deduplicationId made QStash
+        // deliver only the first ingest (2026-11-23 photo loss).
+        const dedupId = inboundDedupId(message);
+        await enqueueWorker("ingest", { kind: "ingest", message }, { deduplicationId: dedupId });
+        await claimWebhookMid(dedupId);
       }),
     );
   } catch (err) {

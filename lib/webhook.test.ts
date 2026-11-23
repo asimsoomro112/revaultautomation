@@ -6,7 +6,7 @@ import { createHmac } from "node:crypto";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { describe, expect, it } from "vitest";
-import { nonEcho, parseWebhookPayload, verifyGetChallenge, verifySignature } from "./webhook";
+import { inboundDedupId, nonEcho, parseWebhookPayload, verifyGetChallenge, verifySignature } from "./webhook";
 import type { NormalizedInbound } from "./types";
 
 const SECRET = "test_app_secret_0123456789";
@@ -111,6 +111,14 @@ describe("parseWebhookPayload", () => {
     expect(ms[0]?.mid).not.toBe(ms[1]?.mid);
   });
 
+  it("parses ONE message with two image attachments into two inbounds sharing one mid", () => {
+    const ms = parseWebhookPayload(fixture("multi-attachment"));
+    expect(ms).toHaveLength(2);
+    expect(ms.map((m) => m.kind)).toEqual(["image", "image"]);
+    expect(ms[0]?.mid).toBe(ms[1]?.mid);
+    expect(ms[0]?.image_url).not.toBe(ms[1]?.image_url);
+  });
+
   it("maps a sticker to unsupported with hint 'sticker'", () => {
     const [m] = parseWebhookPayload(fixture("sticker")) as [NormalizedInbound];
     expect(m.kind).toBe("unsupported");
@@ -201,5 +209,37 @@ describe("parseWebhookPayload", () => {
       ],
     });
     expect(ms).toEqual([]);
+  });
+});
+
+describe("inboundDedupId", () => {
+  // 2026-11-24 re-audit N1 (photo-loss): one message carrying N image
+  // attachments fans out to N inbounds that ALL share one mid. Keying the
+  // QStash deduplicationId on the bare mid made QStash deliver only the
+  // first ingest — photos 2+ were silently dropped, no error anywhere.
+  it("is distinct per attachment when two images share one mid", () => {
+    const ms = parseWebhookPayload(fixture("multi-attachment"));
+    expect(ms).toHaveLength(2);
+    const ids = ms.map((m) => inboundDedupId(m));
+    expect(ids[0]).not.toBe(ids[1]);
+    expect(ids[0]).toContain(ms[0]?.mid ?? "");
+    expect(ids[1]).toContain(ms[1]?.mid ?? "");
+  });
+
+  it("is stable for the same image re-delivered (duplicate suppression still works)", () => {
+    const [a, b] = parseWebhookPayload(fixture("multi-attachment"));
+    expect(inboundDedupId(a!)).toBe(inboundDedupId({ ...a! }));
+    expect(inboundDedupId(a!)).not.toBe(inboundDedupId(b!));
+  });
+
+  it("is the bare mid for non-image inbounds (one per message)", () => {
+    const [m] = parseWebhookPayload(fixture("text")) as [NormalizedInbound];
+    expect(inboundDedupId(m)).toBe(m.mid);
+  });
+
+  it("is distinct for separate messages (existing burst behaviour unchanged)", () => {
+    const ms = parseWebhookPayload(fixture("multi-image"));
+    const ids = ms.map((m) => inboundDedupId(m));
+    expect(new Set(ids).size).toBe(2);
   });
 });
