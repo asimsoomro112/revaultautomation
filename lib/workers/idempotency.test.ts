@@ -351,6 +351,24 @@ describe("transient publish failures", () => {
     expect(state.notifications).toHaveLength(0); // no admin alert until retries exhaust
   });
 
+  it("a network blip during a Meta call (MetaApiError status 0) re-enqueues instead of FAILing", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    // metaRequest wraps fetch/network failures as MetaApiError with status 0
+    // (lib/meta.ts) — the old classifier only retried 429/5xx, so a blip
+    // during a Meta call went straight to failListing while the same blip
+    // from non-Meta code was retried via the message regex.
+    state.meta.failCreateImageWith = new MetaApiError("Meta API request failed: fetch failed", undefined, undefined, 0);
+    const r = await handlePublish("lst1", deps);
+    expect(r.outcome).toBe("retrying");
+    const listing = state.listings.get("lst1")!;
+    expect(listing.status).toBe("QUEUED");
+    expect(listing.publish.attempts).toBe(1);
+    expect(state.publishes).toHaveLength(1);
+    expect(state.dms).toHaveLength(0);
+    expect(state.notifications).toHaveLength(0);
+  });
+
   it("a permanent error still FAILs immediately", async () => {
     const state = makeState();
     const deps = makeDeps(state);

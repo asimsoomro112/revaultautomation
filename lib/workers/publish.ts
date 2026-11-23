@@ -58,11 +58,14 @@ const MAX_TRANSIENT_RETRIES = 3;
 /**
  * True for errors worth retrying: Meta 429 / 5xx, or a network blip
  * (download/upload/fetch). Permanent 4xx and validation errors are not
- * transient — retrying them would just fail again.
+ * transient — retrying them would just fail again. Status 0 is metaRequest's
+ * wrapper for a fetch/network failure (lib/meta.ts) — it never reaches the
+ * message regex below because the MetaApiError branch returns first, so it
+ * must be listed here explicitly.
  */
 function isTransientPublishError(err: unknown): boolean {
   if (err instanceof MetaApiError) {
-    return err.status === 429 || (err.status !== undefined && err.status >= 500);
+    return err.status === 0 || err.status === 429 || (err.status !== undefined && err.status >= 500);
   }
   const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
   return /timeout|timed out|econnreset|enotfound|eai_again|socket|network|fetch failed|\b(503|429)\b/.test(msg);
