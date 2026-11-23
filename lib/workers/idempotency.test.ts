@@ -43,6 +43,7 @@ interface FakeMeta extends MetaClient {
   quota: { quota_usage: number; quota_total: number };
   statusFor: (id: string) => ContainerStatus;
   failPublishWith?: MetaApiError | undefined;
+  failCreateImageWith?: MetaApiError | undefined;
 }
 
 interface FakeState {
@@ -67,12 +68,14 @@ function makeMeta(get: () => FakeState): FakeMeta {
     quota,
     statusFor: (_id: string): ContainerStatus => "FINISHED",
     failPublishWith: undefined,
+    failCreateImageWith: undefined,
     async sendMessage(igsid: string, opts: { text?: string }) {
       calls.send++;
       get().dms.push({ igsid, text: opts.text ?? "" });
       return { messageId: "m1" };
     },
     async createImageContainer(_url: string, _opts?: { isCarouselItem?: boolean; caption?: string }) {
+      if (self.failCreateImageWith) throw self.failCreateImageWith;
       calls.createImage++;
       return `child_${n++}`;
     },
@@ -326,6 +329,46 @@ describe("idempotency — duplicate deliveries publish exactly once", () => {
     const r2 = await handlePublish("lst1", deps2);
     expect(r2.outcome).toBe("not-claimed");
     expect(state.meta.calls.createImage).toBe(2); // no duplicate containers
+  });
+});
+
+describe("transient publish failures", () => {
+  it("a transient Meta 503 on container creation re-enqueues instead of FAILing", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    state.meta.failCreateImageWith = new MetaApiError("503 overloaded", 10, undefined, 503);
+    const r = await handlePublish("lst1", deps);
+    expect(r.outcome).toBe("retrying");
+    const listing = state.listings.get("lst1")!;
+    expect(listing.status).toBe("QUEUED");
+    expect(listing.publish.attempts).toBe(1);
+    expect(listing.publish.last_error).toMatch(/503/);
+    expect(listing.publish.locked_until).toBeNull();
+    expect(state.publishes).toHaveLength(1);
+    expect(state.publishes[0]!.notBefore.getTime() - deps.now().getTime()).toBe(5 * 60_000);
+    expect(state.dms).toHaveLength(0); // no seller failure DM for a transient blip
+    expect(state.notifications).toHaveLength(0); // no admin alert until retries exhaust
+  });
+
+  it("a permanent error still FAILs immediately", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    state.meta.failCreateImageWith = new MetaApiError("Invalid parameter", 100, undefined, 400);
+    const r = await handlePublish("lst1", deps);
+    expect(r.outcome).toBe("failed");
+    expect(state.listings.get("lst1")!.status).toBe("FAILED");
+    expect(state.publishes).toHaveLength(0);
+  });
+
+  it("exhausted transient retries FAIL (no infinite loop)", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    state.listings.get("lst1")!.publish.attempts = 3;
+    state.meta.failCreateImageWith = new MetaApiError("503 overloaded", 10, undefined, 503);
+    const r = await handlePublish("lst1", deps);
+    expect(r.outcome).toBe("failed");
+    expect(state.listings.get("lst1")!.status).toBe("FAILED");
+    expect(state.publishes).toHaveLength(0);
   });
 });
 

@@ -2,7 +2,8 @@
  * POST /api/workers/publish — QStash-signed publish worker (Phase 4).
  * Thin wrapper: verify signature → parse payload → handlePublish.
  * Unexpected throws → 500 so QStash retries; handlePublish itself converts
- * Meta/storage failures into FAILED listings (no retry storm).
+ * permanent failures into FAILED listings, and transient (Meta 5xx/429,
+ * network) failures into a bounded re-enqueue (max 3 retries) — no retry storm.
  */
 export const dynamic = "force-dynamic";
 

@@ -23,6 +23,7 @@
  */
 import { computeNextSlot, tomorrowWindowStart, tzDay } from "@/lib/schedule";
 import { log } from "@/lib/log";
+import { MetaApiError } from "@/lib/meta";
 import {
   failListing,
   liveSettings,
@@ -44,10 +45,27 @@ export interface PublishOutcome {
     | "scheduled"
     | "quota-exhausted"
     | "containers-created"
+    | "retrying"
     | "failed";
   slot_at?: string;
   container_ids?: string[];
   error?: string;
+}
+
+/** Max in-line retries of a transient publish failure before failing closed. */
+const MAX_TRANSIENT_RETRIES = 3;
+
+/**
+ * True for errors worth retrying: Meta 429 / 5xx, or a network blip
+ * (download/upload/fetch). Permanent 4xx and validation errors are not
+ * transient — retrying them would just fail again.
+ */
+function isTransientPublishError(err: unknown): boolean {
+  if (err instanceof MetaApiError) {
+    return err.status === 429 || (err.status !== undefined && err.status >= 500);
+  }
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return /timeout|timed out|econnreset|enotfound|eai_again|socket|network|fetch failed|\b(503|429)\b/.test(msg);
 }
 
 export async function handlePublish(
@@ -227,6 +245,41 @@ export async function handlePublish(
       return { outcome: "killed" };
     }
     const msg = err instanceof Error ? err.message : String(err);
+    // Transient failure (Meta 503/429, network blip) before any
+    // media_publish: re-enqueue with backoff instead of permanently
+    // FAILing — the admin retry is the fallback when retries exhaust.
+    // media_publish itself is never auto-retried (duplicate-post risk);
+    // this catch only covers the pre-publish steps (slides, containers).
+    const attempts = listing.publish.attempts + 1;
+    if (isTransientPublishError(err) && attempts <= MAX_TRANSIENT_RETRIES) {
+      try {
+        const delayMs = Math.min(5 * 60_000 * 2 ** (attempts - 1), 60 * 60_000);
+        const notBefore = new Date(deps.now().getTime() + delayMs);
+        await deps.enqueuePublish(listingId, {
+          notBefore,
+          deduplicationId: `publish:${listingId}:retry:${attempts}`,
+        });
+        await deps.saveListing(listingId, {
+          status: "QUEUED",
+          publish: { ...listing.publish, attempts, last_error: msg, locked_until: null },
+        });
+        await deps.appendEvent(listingId, "publish_retry", { error: msg, attempt: attempts });
+        log.warn("publish worker: transient error — re-enqueued with backoff", {
+          listing_id: listingId,
+          attempt: attempts,
+          delay_ms: delayMs,
+          error: msg.slice(0, 200),
+        });
+        return { outcome: "retrying", error: msg };
+      } catch (retryErr) {
+        // The retry itself failed (e.g. QStash down): fail closed so the
+        // listing is FAILED + alerted instead of stranded PUBLISHING.
+        log.warn("publish worker: transient retry enqueue failed — failing closed", {
+          listing_id: listingId,
+          error: retryErr instanceof Error ? retryErr.message.slice(0, 200) : String(retryErr),
+        });
+      }
+    }
     await failListing(deps, listing, msg);
     return { outcome: "failed", error: msg };
   }
