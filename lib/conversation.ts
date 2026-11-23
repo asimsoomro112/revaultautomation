@@ -38,6 +38,7 @@ import {
   helpText,
   humanHandoffReply,
   listingLimitReply,
+  photoCheckHoldReply,
   questionForField,
   type QuestionSpec,
   sellerGreeting,
@@ -529,6 +530,30 @@ function pendingMissing(listing: ListingDoc): string[] {
   return stored.length > 0 ? stored : readyForConfirm(listing).missing;
 }
 
+/** True when the listing has a photo that never went through finalize
+ * (ingest leaves phash:""; finalize fills it during extraction). Confirming
+ * such a listing would publish an unexamined photo. */
+function hasUnprocessedPhoto(listing: ListingDoc): boolean {
+  return listing.photos.some((p) => !p.phash);
+}
+
+/** Defer CONFIRM until finalize has checked every photo: re-arm it with the
+ * fresh activity (the answer's bump invalidated the photo's own armed
+ * finalize), stay in NEEDS_INFO, and tell the seller to wait. The re-armed
+ * finalize moves the listing to CONFIRM (or REVIEW) once checked — no
+ * deadlock, since finalize's own moveToConfirm does not check phash. */
+async function deferConfirmForPhotoCheck(
+  deps: Deps,
+  convo: ConversationDoc,
+  listing: ListingDoc,
+  nowIso: string,
+): Promise<void> {
+  await rearmFinalizeForText(deps, listing, nowIso);
+  setConversationState(convo, "NEEDS_INFO");
+  await persistConvo(deps, convo);
+  await sendSafe(deps, convo, { text: photoCheckHoldReply(convo.lang) });
+}
+
 // ---------------------------------------------------------------------------
 // Shared: move a complete listing to CONFIRM (message worker + finalize worker)
 // ---------------------------------------------------------------------------
@@ -942,6 +967,12 @@ async function handleInfoAnswer(
   });
   const after = readyForConfirm(updated);
   if (after.ok) {
+    // A photo that arrived after the last extraction has never been visioned
+    // or moderated — confirming now would publish it unexamined.
+    if (hasUnprocessedPhoto(updated)) {
+      await deferConfirmForPhotoCheck(deps, convo, updated, nowIso);
+      return;
+    }
     // A caption edit must keep the seller's words: moveToConfirm would
     // regenerate the caption from `extracted` and discard the edit.
     if (field === "caption") {
@@ -993,6 +1024,12 @@ async function applyDetailsDump(
   });
   const after = readyForConfirm(updated);
   if (after.ok) {
+    // A photo that arrived after the last extraction has never been visioned
+    // or moderated — confirming now would publish it unexamined.
+    if (hasUnprocessedPhoto(updated)) {
+      await deferConfirmForPhotoCheck(deps, convo, updated, nowIso);
+      return true;
+    }
     await moveToConfirm(deps, convo, updated);
   } else {
     await deps.db.saveListing(listing.id, { status: "NEEDS_INFO", missing: after.missing });

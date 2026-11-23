@@ -233,6 +233,19 @@ export function reviewHoldReply(lang: Lang): string {
   }
 }
 
+/** Holding reply while a late photo is being checked before the preview. */
+export function photoCheckHoldReply(lang: Lang): string {
+  switch (lang) {
+    case "ur":
+      return "آپ کی نئی تصویر چیک ہو رہی ہے 👀 تھوڑا انتظار کریں — پریویو جلد بھیجتا ہوں!";
+    case "en":
+      return "Your new photo is being checked 👀 Please wait a moment — I'll send the preview soon!";
+    case "roman":
+    default:
+      return "Aapki nayi photo check ho rahi hai 👀 Thora wait karein — preview jald bhejta hoon!";
+  }
+}
+
 /** Reply for unsupported attachments (video/sticker/audio/gif). */
 export function unsupportedReply(hint: string, lang: Lang): string {
   const h = hint.trim() || "yeh format";

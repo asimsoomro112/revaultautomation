@@ -216,6 +216,42 @@ describe("handleMessage: NEEDS_INFO typed answers", () => {
     expect(deps.fdb.convos.get(IGSID)!.state).toBe("CONFIRM");
   });
 
+  it("late unprocessed photo + answer → stays NEEDS_INFO, finalize re-armed, no confirm", async () => {
+    await seedNeedsInfo();
+    // A 3rd photo arrives after the first two were processed (ingest leaves
+    // phash:"" — finalize fills it). The answer's activity bump invalidates
+    // the photo's own armed finalize, so the answer must not confirm.
+    const stored = deps.fdb.listings.get("lst_1")!;
+    stored.photos.push({ storage_path: "sellers/x/2.jpg", w: 800, h: 1000, phash: "", received_at: NOW });
+    stored.last_photo_at = NOW;
+    stored.last_activity_at = NOW;
+    await handleMessage(payload("mid_5"), makeInbound("text", "mid_5", { text: "2500" }), deps);
+
+    const updated = deps.fdb.listings.get("lst_1")!;
+    expect(updated.extracted!.price_pkr).toBe(2500); // the answer WAS saved
+    expect(updated.status).toBe("NEEDS_INFO");
+    expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
+    expect(deps.enqueued.filter((e) => e.route === "finalize-photos").length).toBeGreaterThan(0);
+    expect(deps.fdb.events.some((e) => e.event.type === "confirm")).toBe(false);
+    const sent = deps.meta.sent[deps.meta.sent.length - 1]!;
+    expect(sent.opts.quickReplies).toBeUndefined(); // holding reply, no consent buttons
+  });
+
+  it("late unprocessed photo + details dump → stays NEEDS_INFO, finalize re-armed", async () => {
+    await seedNeedsInfo();
+    const stored = deps.fdb.listings.get("lst_1")!;
+    stored.photos.push({ storage_path: "sellers/x/2.jpg", w: 800, h: 1000, phash: "", received_at: NOW });
+    stored.last_photo_at = NOW;
+    stored.last_activity_at = NOW;
+    await handleMessage(payload("mid_5"), makeInbound("text", "mid_5", { text: "Price: 2500" }), deps);
+
+    const updated = deps.fdb.listings.get("lst_1")!;
+    expect(updated.extracted!.price_pkr).toBe(2500);
+    expect(updated.status).toBe("NEEDS_INFO");
+    expect(deps.enqueued.filter((e) => e.route === "finalize-photos").length).toBeGreaterThan(0);
+    expect(deps.fdb.events.some((e) => e.event.type === "confirm")).toBe(false);
+  });
+
   it("multi-line details dump applies every field → CONFIRM (Nina, 2026-11-23)", async () => {
     const convo = await deps.db.getOrCreateConversation(IGSID);
     const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
