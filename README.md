@@ -9,7 +9,7 @@ after admin approval (default) — publishes a 4:5 carousel post on a PKT schedu
 Everything is idempotent, kill-switched, and logged.
 
 **Stack:** Next.js 16 (App Router, Vercel) · Instagram API with Instagram Login
-(`graph.instagram.com`, API v26.0) · Gemini (`gemini-3.8-flash` default) ·
+(`graph.instagram.com`, API v26.0) · Gemini (`gemini-3-flash-preview` default) ·
 Firebase (Firestore + Storage) · Upstash QStash (all async/delayed work) ·
 Telegram (admin alerts) · sharp (1080×1350 slide pipeline) · satori (cover slide)
 

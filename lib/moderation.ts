@@ -19,7 +19,7 @@
  */
 import type { ListingDoc, ModerationVerdict } from "./types";
 import type { VisionResult } from "./gemini";
-import { hammingDistance } from "./images";
+import { hammingDistance } from "./dhash";
 import { findDuplicatePhashEntry, findRecentPhashes, isSellerBlocklisted } from "./db";
 import { log } from "./log";
 

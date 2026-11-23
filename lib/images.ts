@@ -1,14 +1,18 @@
 /**
- * Image pipeline — Phase 3.
+ * Branded cover slide — satori ONLY (Phase 3).
  *
- * - processSlide: normalize any input photo to an EXACT 1080×1350 (4:5)
- *   sRGB JPEG with ALL metadata stripped (no GPS/EXIF — never .withMetadata()).
- *   Non-cropping contain-fit over a blurred, darkened copy of itself.
- * - dhash / hammingDistance: 64-bit difference-hash duplicate detection.
- * - buildCoverSlide: optional branded first slide (satori → SVG → sharp).
- *   NEVER invents brand assets: throws BrandAssetsMissing unless
- *   COVER_SLIDE_ENABLED && /brand/colours.json exist. The cover slide stays
- *   OFF until Asim provides logo/colours/voice (see brand/README.md).
+ * WARNING: importing this module loads satori, which loads harfbuzzjs
+ * `hb.wasm`. That wasm file is NOT bundled into Vercel serverless functions
+ * (Next.js file tracing cannot see the dynamic wasm path) — at runtime the
+ * missing file aborts with `Aborted(Error: ENOENT ... 'hb.wasm')`, an
+ * unhandled rejection that kills the whole function process (exit 128). On
+ * 2026-11-23 that crash took down finalize-photos even though finalize never
+ * calls satori — merely importing this module was enough. NEVER import this
+ * module from a worker route (or anything a worker route imports). The
+ * sharp-only ops live in lib/dhash.ts (dhash/hammingDistance) and
+ * lib/slides.ts (processSlide). The cover slide stays OFF until brand assets
+ * exist (see brand/README.md); when it is ever wired in, load it with a
+ * dynamic import() inside the brand-assets gate, never a top-level import.
  */
 import fs from "node:fs";
 import path from "node:path";
@@ -17,9 +21,7 @@ import satori, { type Font as SatoriFontOpt, type FontWeight } from "satori";
 import { createElement as h } from "react";
 import { z } from "zod";
 import { getEnv } from "./env";
-
-export const SLIDE_W = 1080;
-export const SLIDE_H = 1350;
+import { SLIDE_W, SLIDE_H } from "./slides";
 
 /** Thrown when the branded cover slide is requested but assets are missing. */
 export class BrandAssetsMissing extends Error {
@@ -27,98 +29,6 @@ export class BrandAssetsMissing extends Error {
     super(message);
     this.name = "BrandAssetsMissing";
   }
-}
-
-/**
- * Normalize one seller photo to the mandatory 4:5 canvas:
- *   1. .rotate() applies the EXIF orientation so the photo displays correctly,
- *      and the EXIF block is dropped afterwards.
- *   2. Two-pass background: blurred (sigma 40), darkened (55%) cover-fill
- *      copy of the SAME photo — no cropping of the clothing itself.
- *   3. Foreground: contain-fit inside 1080×1350, composited centered.
- *   4. sRGB JPEG q85 (mozjpeg). No .withMetadata() call → all metadata,
- *      including GPS, is stripped by sharp's default behaviour.
- *
- * Output is always exactly 1080×1350 — every carousel slide shares the first
- * slide's aspect ratio (Meta crops all slides to it), so uniformity is
- * mandatory, not cosmetic.
- */
-export async function processSlide(input: Buffer): Promise<Buffer> {
-  if (!Buffer.isBuffer(input) || input.length === 0) {
-    throw new Error("processSlide: empty input buffer");
-  }
-
-  // Background pass: cover-fill → blur → darken. Re-read the input so the two
-  // passes stay independent.
-  const background = await sharp(input)
-    .rotate()
-    .resize(SLIDE_W, SLIDE_H, { fit: "cover" })
-    .blur(40)
-    .modulate({ brightness: 0.55 })
-    .toColorspace("srgb")
-    .jpeg({ quality: 80, mozjpeg: true })
-    .toBuffer();
-
-  // Foreground pass: contain-fit, never cropped, upscales small inputs.
-  const foreground = await sharp(input)
-    .rotate()
-    .resize(SLIDE_W, SLIDE_H, { fit: "inside", withoutEnlargement: false })
-    .toColorspace("srgb")
-    .jpeg({ quality: 90, mozjpeg: true })
-    .toBuffer();
-
-  return sharp(background)
-    .composite([{ input: foreground, gravity: "center" }])
-    .toColorspace("srgb")
-    .jpeg({ quality: 85, mozjpeg: true })
-    .toBuffer();
-}
-
-/**
- * 64-bit dHash as 16 lowercase hex chars.
- * Grayscale → 9×8 → each bit = (pixel[x] < pixel[x+1]), MSB-first.
- * Robust to recompression/resize/re-encode; two visually identical photos
- * hash to distance 0.
- */
-export async function dhash(buf: Buffer): Promise<string> {
-  const raw = await sharp(buf)
-    .grayscale()
-    .resize(9, 8, { fit: "fill" })
-    .raw()
-    .toBuffer();
-  if (raw.length < 72) throw new Error("dhash: unexpected raw buffer size");
-
-  let hex = "";
-  for (let y = 0; y < 8; y++) {
-    for (let bx = 0; bx < 8; bx += 4) {
-      let nibble = 0;
-      for (let k = 0; k < 4; k++) {
-        const x = bx + k;
-        const left = raw[y * 9 + x] ?? 0;
-        const right = raw[y * 9 + x + 1] ?? 0;
-        nibble = (nibble << 1) | (left < right ? 1 : 0);
-      }
-      hex += nibble.toString(16);
-    }
-  }
-  return hex;
-}
-
-/** Hamming distance between two 16-hex-char dHashes (0..64). */
-export function hammingDistance(a: string, b: string): number {
-  const re = /^[0-9a-f]{16}$/i;
-  if (!re.test(a) || !re.test(b)) {
-    throw new Error("hammingDistance: hashes must be 16 hex chars");
-  }
-  let dist = 0;
-  for (let i = 0; i < 16; i++) {
-    let xor = parseInt(a[i] ?? "0", 16) ^ parseInt(b[i] ?? "0", 16);
-    while (xor) {
-      dist += xor & 1;
-      xor >>>= 1;
-    }
-  }
-  return dist;
 }
 
 // ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@
  */
 import type { ConversationDoc, FinalizePhotosPayload, ListingDoc, ModerationResult } from "./types";
 import { applyModeration } from "./moderation";
-import { dhash } from "./images";
+import { dhash } from "./dhash";
 import {
   moveToConfirm,
   nextQuestion,

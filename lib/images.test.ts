@@ -4,12 +4,9 @@
  */
 import { describe, expect, it } from "vitest";
 import sharp from "sharp";
+import { SLIDE_W, SLIDE_H, processSlide } from "./slides";
+import { dhash, hammingDistance } from "./dhash";
 import {
-  SLIDE_W,
-  SLIDE_H,
-  processSlide,
-  dhash,
-  hammingDistance,
   brandAssetsAvailable,
   buildCoverSlide,
   BrandAssetsMissing,

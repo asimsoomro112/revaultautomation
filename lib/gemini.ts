@@ -1,9 +1,9 @@
 /**
  * Google Gemini client — Phase 2 implementation.
  *
- * Uses @google/genai with GEMINI_MODEL from env (default gemini-3.8-flash;
- * verified 2026-09-30 against ai.google.dev/gemini-api/docs/models — 3.8 Flash
- * is the current stable flagship; 3.5 Flash remains a valid stable fallback).
+ * Uses @google/genai with GEMINI_MODEL from env (default gemini-3-flash-preview;
+ * verified working 2026-11-23 — gemini-3.8-flash returned 503 "high demand" on
+ * every finalize that day, while gemini-3-flash-preview answered fine).
  * NEVER the gemini-2.5 family (retires 2026-10-16) — guarded at client creation.
  *
  * Structured output: the installed SDK (v2.x) routes raw JSON schemas through
@@ -54,6 +54,17 @@ export class GeminiError extends Error {
     this.name = "GeminiError";
   }
 }
+
+/**
+ * Backoff (ms) between extractListing retries on transient Gemini errors
+ * (503 overload, 429, 5xx, network blips). 2026-11-23: gemini-3.8-flash
+ * returned 503 "high demand" on every finalize, and the old code fail-closed
+ * each listing to NEEDS_REVIEW on the first failure. The retry loop sleeps
+ * these delays between attempts; tests override them to 0 via __testing__.
+ */
+let extractRetryDelaysMs = [2000, 4000];
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 
 // ---------------------------------------------------------------------------
 // zod schemas (validate what the model returns)
@@ -204,7 +215,7 @@ function resolveModel(): string {
   const model = getEnv().GEMINI_MODEL;
   if (model.startsWith("gemini-2.5")) {
     throw new Error(
-      `Refusing to use retired model family: GEMINI_MODEL=${model} (gemini-2.5 retires 2026-10-16). Set GEMINI_MODEL to a supported model, e.g. gemini-3.8-flash.`,
+      `Refusing to use retired model family: GEMINI_MODEL=${model} (gemini-2.5 retires 2026-10-16). Set GEMINI_MODEL to a supported model, e.g. gemini-3-flash-preview.`,
     );
   }
   return model;
@@ -290,30 +301,45 @@ class GeminiClientImpl implements GeminiClient {
       inlineData: { data: buf.toString("base64"), mimeType: "image/jpeg" },
     }));
     parts.push({ text: visionPrompt(chatText, lang) });
-    try {
-      const res = await this.ai.models.generateContent({
-        model: this.model,
-        contents: parts as never,
-        config: {
-          responseMimeType: "application/json",
-          responseJsonSchema: visionJsonSchema,
-          temperature: 0.1,
-        },
-      });
-      const json = parseJsonResponse(res.text, "extractListing");
-      const parsed = visionZod.safeParse(json);
-      if (!parsed.success) {
-        const issues = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-        throw new GeminiError(`extractListing: schema validation failed — ${issues.slice(0, 400)}`, false);
+    // Transient Gemini outages (503 overload, 429, 5xx, network blips) must
+    // NOT fail a listing closed on the first spike: retry in-line with
+    // backoff, and only fail-closed (via the caller's catch) when the error
+    // is non-retryable or the retries are exhausted — by then the outage is
+    // real, not a spike.
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const res = await this.ai.models.generateContent({
+          model: this.model,
+          contents: parts as never,
+          config: {
+            responseMimeType: "application/json",
+            responseJsonSchema: visionJsonSchema,
+            temperature: 0.1,
+          },
+        });
+        const json = parseJsonResponse(res.text, "extractListing");
+        const parsed = visionZod.safeParse(json);
+        if (!parsed.success) {
+          const issues = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
+          throw new GeminiError(`extractListing: schema validation failed — ${issues.slice(0, 400)}`, false);
+        }
+        const { extracted, missing, moderation } = parsed.data;
+        return {
+          extracted: { ...extracted, confidence: { ...extracted.confidence } } as ExtractedItem,
+          missing,
+          moderation: moderation as ModerationResult,
+        };
+      } catch (err) {
+        const mapped = classifyGeminiError(err, "extractListing");
+        const delayMs = extractRetryDelaysMs[attempt];
+        if (!mapped.retryable || delayMs === undefined) throw mapped;
+        log.warn("extractListing: transient Gemini error — retrying", {
+          attempt: attempt + 1,
+          delay_ms: delayMs,
+          error: mapped.message.slice(0, 200),
+        });
+        await sleep(delayMs);
       }
-      const { extracted, missing, moderation } = parsed.data;
-      return {
-        extracted: { ...extracted, confidence: { ...extracted.confidence } } as ExtractedItem,
-        missing,
-        moderation: moderation as ModerationResult,
-      };
-    } catch (err) {
-      throw classifyGeminiError(err, "extractListing");
     }
   }
 
@@ -365,6 +391,7 @@ export const __testing__ = {
   resetClient: () => {
     cachedClient = null;
     resetEnvCache();
+    extractRetryDelaysMs = [2000, 4000];
   },
   resolveModel,
   classifyGeminiError,
@@ -372,4 +399,8 @@ export const __testing__ = {
   visionJsonSchema,
   intentZod,
   visionZod,
+  /** Tests set this to [0, 0] so retry tests don't sleep for real. */
+  setExtractRetryDelays: (delays: number[]) => {
+    extractRetryDelaysMs = delays;
+  },
 };

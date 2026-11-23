@@ -19,7 +19,7 @@ import {
   setLastPublishAt,
 } from "@/lib/db";
 import { downloadBytes, signedReadUrl, uploadBytes } from "@/lib/storage";
-import { processSlide } from "@/lib/images";
+import { processSlide } from "@/lib/slides";
 import { getMetaClient, MetaApiError, type MetaClient } from "@/lib/meta";
 import { notifyAdmin } from "@/lib/telegram";
 import { log } from "@/lib/log";

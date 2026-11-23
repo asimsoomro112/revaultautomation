@@ -5,7 +5,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-vi.mock("@/lib/images", () => ({
+vi.mock("@/lib/slides", () => ({
   processSlide: async () => Buffer.from("processed"),
 }));
 

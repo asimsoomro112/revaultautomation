@@ -145,19 +145,35 @@ async function handleImage(message: NormalizedInbound, deps: IngestDeps, now: st
   // Download bytes NOW — Meta CDN URLs expire, so this cannot wait.
   const photoId = sanitizePhotoId(message.mid);
   const destPath = `raw/${listingId}/${photoId}.jpg`;
-  const { bytes } = await deps.downloadImage(message.image_url, destPath);
 
-  const photo: ListingPhoto = {
-    storage_path: destPath,
-    w: 0, // Phase 3 fills real dimensions + phash during processing
-    h: 0,
-    phash: "",
-    received_at: now,
-  };
-  await deps.saveListing(listingId, {
-    photos: [...listing.photos, photo],
-    last_photo_at: now,
-  });
+  // Idempotent append: a QStash retry re-running this ingest (same mid →
+  // same storage_path) must not append the same photo twice — on 2026-11-23
+  // the pre-fix ingest 500s made QStash retry whole ingests and listings
+  // 1–2 ended up with the same photo twice. The photo is already saved and
+  // finalize is already armed, so just touch last_photo_at and re-arm below.
+  // Skipping the download also avoids failing on a Meta CDN URL that has
+  // expired since the first delivery.
+  const alreadySaved = listing.photos.some((p) => p.storage_path === destPath);
+  let downloadedBytes = 0;
+  if (!alreadySaved) {
+    const { bytes } = await deps.downloadImage(message.image_url, destPath);
+    downloadedBytes = bytes;
+
+    const photo: ListingPhoto = {
+      storage_path: destPath,
+      w: 0, // Phase 3 fills real dimensions + phash during processing
+      h: 0,
+      phash: "",
+      received_at: now,
+    };
+    await deps.saveListing(listingId, {
+      photos: [...listing.photos, photo],
+      last_photo_at: now,
+    });
+  } else {
+    await deps.saveListing(listingId, { last_photo_at: now });
+    log.info("ingest: duplicate photo delivery skipped", { listingId });
+  }
   await deps.saveConversation(igsid, {
     state: "COLLECTING",
     active_listing_id: listingId,
@@ -176,7 +192,7 @@ async function handleImage(message: NormalizedInbound, deps: IngestDeps, now: st
     },
   );
 
-  log.info("ingest: photo saved", { listingId, bytes });
+  if (!alreadySaved) log.info("ingest: photo saved", { listingId, bytes: downloadedBytes });
   return { action: "photo-saved", listingId };
 }
 

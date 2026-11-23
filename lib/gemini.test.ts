@@ -18,7 +18,7 @@ vi.mock("@google/genai", () => {
 
 import { GeminiError, __testing__, getGeminiClient } from "./gemini";
 
-const { classifyGeminiError, resetClient, resolveModel } = __testing__;
+const { classifyGeminiError, resetClient, resolveModel, setExtractRetryDelays } = __testing__;
 
 function jsonReply(obj: unknown) {
   generateContent.mockResolvedValueOnce({ text: JSON.stringify(obj) });
@@ -123,5 +123,36 @@ describe("getGeminiClient.extractListing", () => {
     const call = generateContent.mock.calls[0]![0];
     // Multimodal: images ride along as inlineData parts.
     expect(JSON.stringify(call)).toMatch(/inlineData/);
+  });
+  it("retries a transient 503 once, then succeeds", async () => {
+    setExtractRetryDelays([0, 0]);
+    generateContent.mockRejectedValueOnce(
+      new Error(
+        '{"error":{"code":503,"message":"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.","status":"UNAVAILABLE"}}',
+      ),
+    );
+    jsonReply(visionJson);
+    const client = getGeminiClient();
+    const res = await client.extractListing([Buffer.from("img")], "chat text", "roman");
+    expect(res.extracted.category).toBe("blazer");
+    expect(generateContent).toHaveBeenCalledTimes(2);
+  });
+  it("gives up after the retries are exhausted — still a retryable GeminiError", async () => {
+    setExtractRetryDelays([0, 0]);
+    generateContent.mockRejectedValue(new Error("503 overloaded"));
+    const client = getGeminiClient();
+    const err = await client.extractListing([Buffer.from("img")], "chat text", "roman").catch((e) => e);
+    expect(err).toBeInstanceOf(GeminiError);
+    expect(err.retryable).toBe(true);
+    expect(generateContent).toHaveBeenCalledTimes(3);
+  });
+  it("does NOT retry a non-retryable error (401)", async () => {
+    setExtractRetryDelays([0, 0]);
+    generateContent.mockRejectedValueOnce(new Error("401 invalid api key"));
+    const client = getGeminiClient();
+    const err = await client.extractListing([Buffer.from("img")], "chat text", "roman").catch((e) => e);
+    expect(err).toBeInstanceOf(GeminiError);
+    expect(err.retryable).toBe(false);
+    expect(generateContent).toHaveBeenCalledOnce();
   });
 });

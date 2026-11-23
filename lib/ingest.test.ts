@@ -149,6 +149,19 @@ describe("processIngest — image", () => {
     expect(enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(2);
   });
 
+  it("a duplicate delivery of the same photo (same mid) appends it only once", async () => {
+    const { deps, downloads } = makeDeps();
+    const msg = makeInbound("image", "m_img1", { image_url: "https://cdn.example/a.jpg" });
+    await processIngest({ kind: "ingest", message: msg }, deps);
+    // QStash retries the whole ingest (same mid → same storage_path).
+    await processIngest({ kind: "ingest", message: msg }, deps);
+    const listing = await deps.getListing("lst_test123");
+    expect(listing?.photos).toHaveLength(1);
+    expect(listing?.photos[0]?.storage_path).toBe("raw/lst_test123/m_img1.jpg");
+    // The second delivery skips the download too (the CDN URL may be expired).
+    expect(downloads).toHaveLength(1);
+  });
+
   it("starts a new listing when the active one is no longer DRAFT", async () => {
     const { deps } = makeDeps();
     await processIngest(
