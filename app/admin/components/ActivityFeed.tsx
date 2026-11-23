@@ -74,6 +74,7 @@ export default function ActivityFeed() {
                   <td>
                     {it.detail ?? "—"}
                     {typeof it.photo_count === "number" ? ` · ${it.photo_count} photos` : ""}
+                    {it.error ? ` · ${it.error}` : ""}
                   </td>
                 </tr>
               ))}

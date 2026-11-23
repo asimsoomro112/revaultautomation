@@ -102,6 +102,9 @@ export interface ActivityItem {
   detail: string | null;
   /** Set on finalized events: how many photos the extraction actually saw. */
   photo_count?: number | null;
+  /** Set on finalize_retry events: the transient error that scheduled the retry. */
+  error?: string | null;
+  attempt?: number | null;
 }
 
 export interface BannedSeller {

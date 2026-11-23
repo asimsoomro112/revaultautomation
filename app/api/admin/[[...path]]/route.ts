@@ -317,6 +317,8 @@ async function handleGet(path: string[]) {
             by?: string | null;
             detail?: string | null;
             photo_count?: number;
+            error?: string;
+            attempt?: number;
           };
           return {
             id: e.id,
@@ -326,6 +328,8 @@ async function handleGet(path: string[]) {
             by: data.by ?? null,
             detail: data.detail ?? null,
             photo_count: typeof data.photo_count === "number" ? data.photo_count : null,
+            error: typeof data.error === "string" ? data.error : null,
+            attempt: typeof data.attempt === "number" ? data.attempt : null,
           };
         });
       }),

@@ -38,7 +38,7 @@ const mocks = vi.hoisted(() => {
     events: [] as Array<{
       id: string;
       listingId: string;
-      data: { type: string; at: string; by?: string | null; detail?: string | null; photo_count?: number };
+      data: { type: string; at: string; by?: string | null; detail?: string | null; photo_count?: number; error?: string; attempt?: number };
     }>,
     getAdminSettings: vi.fn(async () => settings),
     updateAdminSettings: vi.fn(async (patch: Record<string, unknown>) => {
@@ -257,19 +257,24 @@ describe("GET /api/admin/activity", () => {
     mocks.events.push(
       { id: "e1", listingId: "lst_old", data: { type: "approved", at: "2026-11-20T10:00:00.000Z", by: "a@test", detail: "Approved in /admin" } },
       { id: "e2", listingId: "lst_new", data: { type: "finalized", at: "2026-11-23T09:00:00.000Z", by: null, detail: null, photo_count: 3 } },
+      { id: "e3", listingId: "lst_new", data: { type: "finalize_retry", at: "2026-11-23T09:01:00.000Z", by: null, detail: null, error: "Gemini 503 overloaded", attempt: 1 } },
     );
     const res = await GET(getReq("activity"), ctx(["activity"]));
     expect(res.status).toBe(200);
     const data = (await res.json()) as {
-      items: Array<{ id: string; listing_id: string; type: string; at: string; photo_count: number | null }>;
+      items: Array<{ id: string; listing_id: string; type: string; at: string; photo_count: number | null; error: string | null; attempt: number | null }>;
     };
-    expect(data.items).toHaveLength(2);
-    expect(data.items[0]?.id).toBe("e2");
-    expect(data.items[0]?.listing_id).toBe("lst_new");
-    expect(data.items[0]?.type).toBe("finalized");
-    expect(data.items[0]?.photo_count).toBe(3);
-    expect(data.items[1]?.listing_id).toBe("lst_old");
-    expect(data.items[1]?.photo_count).toBeNull();
+    expect(data.items).toHaveLength(3);
+    expect(data.items[0]?.id).toBe("e3");
+    expect(data.items[0]?.type).toBe("finalize_retry");
+    expect(data.items[0]?.error).toBe("Gemini 503 overloaded");
+    expect(data.items[0]?.attempt).toBe(1);
+    expect(data.items[1]?.id).toBe("e2");
+    expect(data.items[1]?.listing_id).toBe("lst_new");
+    expect(data.items[1]?.type).toBe("finalized");
+    expect(data.items[1]?.photo_count).toBe(3);
+    expect(data.items[2]?.listing_id).toBe("lst_old");
+    expect(data.items[2]?.photo_count).toBeNull();
   });
 });
 

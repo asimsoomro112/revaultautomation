@@ -158,6 +158,9 @@ Workflow: `.agents/workflows/verify.md` (lint → typecheck → test).
   whether a burst's photos all reached extraction).
 - Test: the admin-api mock's collectionGroup THROWS now, so any future
   use fails the test instead of prod.
+- Follow-up (2026-11-23 ~23:51): the feed also surfaces the event's
+  `error` + `attempt` (finalize_retry events carry those, not `detail`) —
+  the retry's exact error is now readable in the Detail column.
 
 ## Claude audit fixes (2026-11-23)
 - **Test clock:** `sendSafe` (and any 24h-window check) must use the injected
