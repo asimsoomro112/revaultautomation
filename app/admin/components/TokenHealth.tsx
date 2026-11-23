@@ -25,6 +25,9 @@ export default function TokenHealth() {
   }, []);
 
   useEffect(() => {
+    // Mount fetch: load() only sets state after the async fetch resolves,
+    // so there is no cascading render; the rule cannot see through the call.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
 
@@ -58,7 +61,7 @@ export default function TokenHealth() {
   }
 
   return (
-    <section className={styles.section}>
+    <section className={styles.section} id="token">
       <h2 className={styles.sectionTitle}>Token health</h2>
       {error && <div className={styles.alert}>{error}</div>}
       {health && (

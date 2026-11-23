@@ -18,6 +18,9 @@ export default function QuotaGauge() {
   }, []);
 
   useEffect(() => {
+    // Mount fetch: load() only sets state after the async fetch resolves,
+    // so there is no cascading render; the rule cannot see through the call.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
 
@@ -31,7 +34,7 @@ export default function QuotaGauge() {
   const ringC = 2 * Math.PI * 48;
 
   return (
-    <section className={styles.section}>
+    <section className={styles.section} id="quota">
       <div className={styles.sectionHead}>
         <h2 className={styles.sectionTitle}>Quota</h2>
         <button className={styles.btn} onClick={load}>

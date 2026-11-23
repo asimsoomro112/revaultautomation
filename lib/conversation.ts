@@ -383,7 +383,7 @@ export async function sendSafe(
   convo: ConversationDoc,
   opts: SendMessageOpts,
 ): Promise<{ sent: boolean; messageId?: string }> {
-  if (!isWithinWindow(convo.last_user_msg_at)) {
+  if (!isWithinWindow(convo.last_user_msg_at, Date.parse(deps.now()))) {
     convo.window_open = false;
     await persistConvo(deps, convo);
     log.warn("message.window_closed_skip_send", { igsid: convo.igsid });

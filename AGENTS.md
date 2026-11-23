@@ -94,6 +94,27 @@ Workflow: `.agents/workflows/verify.md` (lint → typecheck → test).
 - Don't widen Firestore rules for convenience; use the admin claim.
 - Don't "fix" a failing test by weakening the assertion — fix the code.
 
+## Claude audit fixes (2026-11-23)
+- **Test clock:** `sendSafe` (and any 24h-window check) must use the injected
+  clock — `isWithinWindow(x, Date.parse(deps.now()))` — never `Date.now()`.
+  Fixtures are pinned to 2026-09-30; the real clock made 18 tests fail once
+  that date aged past 24h. Fixed 2026-11-23: 292/292 green.
+- **Lint:** flat `eslint.config.mjs` (eslint-config-next core-web-vitals +
+  typescript). `npm run lint` is `--max-warnings=0`; `_`-prefixed args are
+  ignored by config; mount-fetch effects carry a documented
+  `react-hooks/set-state-in-effect` disable.
+- **Firestore indexes:** `firestore.indexes.json` (+ `firebase.json` ref) —
+  listings (status ASC, created_at ASC) for retention/reconcile ranges and
+  (status ASC, created_at DESC) for the publish-log orderBy. Deploy with
+  `firebase deploy --only firestore:indexes`.
+- **Crons:** vercel.json schedules token-refresh 03:00, retention 03:30,
+  reconcile 04:00 daily (Hobby plan = daily only).
+- **Secrets:** `scratch/` is gitignored; the pre-commit hook blocks `IGAA…`
+  tokens and `service[- ]account*.json`. Never commit scratch files.
+- **Next.js:** 16.4.6 (upgraded from 16.3.8 for the Oct 14 critical RCE/DoS
+  fixes). Upgrade with plain `npm install next@latest` — never `--force`
+  (it would downgrade Firebase to v9).
+
 <!-- BEGIN:nextjs-agent-rules -->
 
 # This is NOT the Next.js you know

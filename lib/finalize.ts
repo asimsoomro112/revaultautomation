@@ -89,7 +89,7 @@ export async function handleFinalizePhotos(
       if (!buf) continue;
       try {
         photo.phash = await dhash(buf);
-      } catch (err) {
+      } catch {
         log.warn("finalize.dhash_failed", { listing_id: listing.id, index: i });
       }
     }

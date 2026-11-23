@@ -17,6 +17,7 @@ import PublishLog from "./components/PublishLog";
 import QuotaGauge from "./components/QuotaGauge";
 import KillSwitch from "./components/KillSwitch";
 import TokenHealth from "./components/TokenHealth";
+import BottomNav from "./components/BottomNav";
 import LogoMark from "../components/LogoMark";
 import { adminFetch } from "./components/api";
 import styles from "./styles.module.css";
@@ -24,16 +25,15 @@ import styles from "./styles.module.css";
 type AuthPhase = "loading" | "signed-out" | "checking" | "denied" | "ready";
 
 export default function AdminPage() {
-  const [phase, setPhase] = useState<AuthPhase>("loading");
+  const [configError] = useState<string | null>(() => getClientConfigError());
+  const [phase, setPhase] = useState<AuthPhase>(
+    configError ? "signed-out" : "loading",
+  );
   const [user, setUser] = useState<User | null>(null);
   const [deniedMsg, setDeniedMsg] = useState<string>("");
-  const [configError] = useState<string | null>(() => getClientConfigError());
 
   useEffect(() => {
-    if (configError) {
-      setPhase("signed-out");
-      return;
-    }
+    if (configError) return;
     const unsub = onAuthStateChanged(getClientAuth(), async (u) => {
       setUser(u);
       if (!u) {
@@ -115,6 +115,7 @@ export default function AdminPage() {
         <KillSwitch />
         <PublishLog />
       </main>
+      <BottomNav />
     </div>
   );
 }

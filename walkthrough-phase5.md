@@ -66,7 +66,9 @@ All routes require admin auth (401/403 otherwise); every mutation appends to
   failure → Telegram alert + `token_health: "degraded"`.
 - `app/api/cron/retention/route.ts` — deletes `raw/{listingId}/` originals for
   PUBLISHED/REJECTED listings older than `RETENTION_DAYS`; `slides/` kept.
-  Single-field queries only (no composite index needed).
+  Composite index on `listings` (`status` + `created_at`) is required — see
+  `firestore.indexes.json` (one ASC, one DESC on `created_at`): the publish-log
+  orders `created_at` desc, while retention/reconcile range on it.
 - `app/api/cron/reconcile/route.ts` — listings stuck in PUBLISHING > 2h with no
   worker activity → FAILED + Telegram alert. **Documented limitation:** the
   DM-vs-webhook diff is skipped — reading recent conversations needs extra Meta

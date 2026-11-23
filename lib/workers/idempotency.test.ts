@@ -132,6 +132,7 @@ function makeListing(): ListingDoc {
 }
 
 function makeState(over: Partial<FakeState> = {}): FakeState {
+  // eslint-disable-next-line prefer-const -- `meta` closes over `state` before it is assigned below.
   let state!: FakeState;
   const meta = makeMeta(() => state);
   state = {

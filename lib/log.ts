@@ -10,8 +10,6 @@ type Level = "debug" | "info" | "warn" | "error";
 
 const PHONE_RE = /(\+?\d[\d\s\-()]{7,}\d)/g;
 const EMAIL_RE = /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/g;
-// Very rough address heuristic: number + street-ish words. Keep conservative.
-const ADDRESS_RE = /\b\d{1,5}\s+[A-Za-z]{3,}(?:\s+[A-Za-z]{3,}){1,4}\b/g;
 
 const SECRET_KEYS = new Set([
   "token",

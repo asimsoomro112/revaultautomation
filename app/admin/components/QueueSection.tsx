@@ -49,6 +49,9 @@ function ListingCard({
 
       <div className={styles.photos}>
         {item.photo_urls.filter(Boolean).map((u, i) => (
+          // Admin-only previews of signed, short-lived Cloudinary URLs;
+          // next/image optimization is not worth the remote-pattern setup here.
+          // eslint-disable-next-line @next/next/no-img-element
           <img key={i} src={u} alt={`photo ${i + 1}`} loading="lazy" />
         ))}
         {item.photo_urls.filter(Boolean).length === 0 && (
@@ -185,10 +188,13 @@ export default function QueueSection() {
   }, []);
 
   useEffect(() => {
+    // Mount fetch: load() only sets state after the async fetch resolves,
+    // so there is no cascading render; the rule cannot see through the call.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
   return (
-    <section className={`${styles.section} ${styles.sectionFlat}`}>
+    <section className={`${styles.section} ${styles.sectionFlat}`} id="queue">
       <div className={styles.sectionHead}>
         <h2 className={styles.sectionTitle}>
           Review queue {items ? `(${items.length})` : ""}
