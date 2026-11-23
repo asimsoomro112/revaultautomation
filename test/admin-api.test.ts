@@ -116,7 +116,30 @@ vi.mock("@/lib/firebase-admin", () => {
             update: async (patch: Record<string, unknown>) => {
               const cur = mocks.listingById.get(id);
               if (!cur) throw new Error(`fakeDb listings doc(${id}) missing`);
-              mocks.listingById.set(id, { ...cur, ...patch });
+              // Firestore update() applies dotted keys ("publish.last_error")
+              // as nested sets — the fake must too, or a test asserting on
+              // the nested field would pass while prod loses the value.
+              const next: Record<string, unknown> = { ...cur };
+              for (const [key, value] of Object.entries(patch)) {
+                const parts = key.split(".");
+                if (parts.length === 1) {
+                  next[key] = value;
+                  continue;
+                }
+                let target = next;
+                for (let i = 0; i < parts.length - 1; i++) {
+                  const p = parts[i]!;
+                  const existing = target[p];
+                  const obj =
+                    existing && typeof existing === "object" && !Array.isArray(existing)
+                      ? { ...(existing as Record<string, unknown>) }
+                      : {};
+                  target[p] = obj;
+                  target = obj;
+                }
+                target[parts[parts.length - 1]!] = value;
+              }
+              mocks.listingById.set(id, next);
             },
           }),
         };
@@ -388,6 +411,18 @@ describe("POST /api/admin/listings/:id/approve", () => {
     expect(res.status).toBe(409);
     expect(mocks.listingById.get("lst1")).toMatchObject({ status: "PUBLISHING" });
   });
+
+  it("returns 409 when the kill switch is on (no status change, no enqueue)", async () => {
+    mocks.listingById.set("lst1", { status: "NEEDS_REVIEW", review: emptyReview });
+    mocks.settings.global_kill_switch = true;
+    const res = await POST(postReq("listings/lst1/approve", {}), ctx(["listings", "lst1", "approve"]));
+    expect(res.status).toBe(409);
+    const data = (await res.json()) as { ok: boolean; error: string };
+    expect(data.ok).toBe(false);
+    expect(data.error).toMatch(/kill switch/i);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "NEEDS_REVIEW" });
+    expect(enqueuePublishWorker).not.toHaveBeenCalled();
+  });
 });
 
 describe("POST /api/admin/listings/:id/retry", () => {
@@ -413,6 +448,34 @@ describe("POST /api/admin/listings/:id/retry", () => {
       "retry_enqueue_failed",
       expect.objectContaining({ detail: expect.stringContaining("QStash") }),
     );
+  });
+
+  it("restores publish.last_error when the publish enqueue fails", async () => {
+    mocks.listingById.set("lst1", {
+      status: "FAILED",
+      publish: { last_error: "container creation 503", attempts: 2 },
+    });
+    vi.mocked(enqueuePublishWorker).mockResolvedValueOnce(false);
+    const res = await POST(postReq("listings/lst1/retry", {}), ctx(["listings", "lst1", "retry"]));
+    expect(res.status).toBe(502);
+    const stored = mocks.listingById.get("lst1") as {
+      status: string;
+      publish: { last_error: string | null };
+    };
+    expect(stored.status).toBe("FAILED");
+    expect(stored.publish.last_error).toBe("container creation 503");
+  });
+
+  it("returns 409 when the kill switch is on (no status change, no enqueue)", async () => {
+    mocks.listingById.set("lst1", { status: "FAILED" });
+    mocks.settings.global_kill_switch = true;
+    const res = await POST(postReq("listings/lst1/retry", {}), ctx(["listings", "lst1", "retry"]));
+    expect(res.status).toBe(409);
+    const data = (await res.json()) as { ok: boolean; error: string };
+    expect(data.ok).toBe(false);
+    expect(data.error).toMatch(/kill switch/i);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "FAILED" });
+    expect(enqueuePublishWorker).not.toHaveBeenCalled();
   });
 });
 

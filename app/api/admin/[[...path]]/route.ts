@@ -170,6 +170,24 @@ async function tryNotifySeller(igsid: string, text: string): Promise<void> {
   }
 }
 
+/**
+ * 409 response when publishing is paused by the global kill switch, null
+ * when clear. Approve/retry must check this BEFORE mutating: without it an
+ * approve returns {ok:true, enqueued:true} while the worker parks the
+ * listing back to QUEUED and fires a Telegram "parked" alert — the admin
+ * sees success, and each click spams another alert (2026-11-24 re-audit
+ * Lane B N3).
+ */
+async function killSwitchBlock(): Promise<NextResponse | null> {
+  const s = await getAdminSettings();
+  return s.global_kill_switch
+    ? NextResponse.json(
+        { ok: false, error: "Publishing is paused (kill switch is on) — turn it off in /admin/kill before approving or retrying" },
+        { status: 409 },
+      )
+    : null;
+}
+
 // --- route handlers --------------------------------------------------------
 
 async function handleGet(path: string[]) {
@@ -407,6 +425,8 @@ async function handlePost(
         { status: 409 },
       );
     }
+    const blocked = await killSwitchBlock();
+    if (blocked) return blocked;
     await ref.update({
       status: "APPROVED",
       review: { note: null, decided_by: by, decided_at: new Date().toISOString() },
@@ -512,13 +532,19 @@ async function handlePost(
         { status: 409 },
       );
     }
+    const blocked = await killSwitchBlock();
+    if (blocked) return blocked;
+    // Keep the original failure reason: the rollback below restores it, or
+    // the retry's own failure would erase the only record of why the
+    // listing FAILED in the first place (Fix #10 gap, 2026-11-24 re-audit).
+    const prevError = data.publish?.last_error ?? null;
     await ref.update({ status: "QUEUED", "publish.last_error": null });
     await appendListingEvent(b, "retry", { by, detail: "Re-queued from /admin" });
     const enqueued = await enqueuePublishWorker(b);
     if (!enqueued) {
       // Same strand as approve: a QUEUED listing with no worker enqueued
       // would never publish. Roll back to FAILED so the admin can retry.
-      await ref.update({ status: "FAILED" });
+      await ref.update({ status: "FAILED", "publish.last_error": prevError });
       await appendListingEvent(b, "retry_enqueue_failed", {
         by,
         detail: "Publish worker could not be enqueued (QStash) — listing left in FAILED",
