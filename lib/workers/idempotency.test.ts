@@ -360,6 +360,21 @@ describe("gates", () => {
     expect(state.listings.get("lst1")!.publish.last_error).toBe("killed");
   });
 
+  it("kill switch parks as QUEUED, not PUBLISHING — reconcile must not FAIL it", async () => {
+    const state = makeState({ settings: makeSettings({ global_kill_switch: true }) });
+    const deps = makeDeps(state);
+    const r = await handlePublish("lst1", deps);
+    expect(r.outcome).toBe("killed");
+    const listing = state.listings.get("lst1")!;
+    // A parked listing is waiting for the admin (turn the switch off, then
+    // Approve), not stuck: reconcile marks PUBLISHING listings with no
+    // activity > 2h as FAILED, which would wrongly kill a healthy parked
+    // listing. QUEUED is also claimable, so Approve resumes it.
+    expect(listing.status).toBe("QUEUED");
+    expect(listing.publish.last_error).toBe("killed");
+    expect(listing.publish.locked_until).toBeNull();
+  });
+
   it("future slot re-enqueues with notBefore", async () => {
     const state = makeState();
     state.nowIso = "2026-09-30T05:00:00Z"; // 10:00 PKT — before the window

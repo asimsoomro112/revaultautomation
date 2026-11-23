@@ -141,8 +141,18 @@ export async function liveSettings(deps: WorkerDeps): Promise<AdminSettings> {
 }
 
 /** Park a job because the kill switch is on: keep state, clear the lease, alert. */
+/**
+ * Park a listing when the kill switch is engaged: back to QUEUED (NOT
+ * PUBLISHING) with the lease released and last_error "killed". QUEUED is
+ * the honest state — the listing is waiting for the admin to turn the
+ * switch off and Approve it, not stuck mid-publish. Leaving it
+ * PUBLISHING would let the reconcile cron mark it FAILED after 2h of no
+ * activity, wrongly killing a healthy listing. The admin resumes it from
+ * /admin (approve accepts QUEUED and re-enqueues the publish worker).
+ */
 export async function parkForKillSwitch(deps: WorkerDeps, listing: ListingDoc): Promise<void> {
   await deps.saveListing(listing.id, {
+    status: "QUEUED",
     publish: { ...listing.publish, locked_until: null, last_error: "killed" },
   });
   await deps.appendEvent(listing.id, "killed_parked", {});
