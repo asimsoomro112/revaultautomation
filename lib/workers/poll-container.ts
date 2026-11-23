@@ -233,17 +233,46 @@ async function handleFinished(
   if (!allDone || listing.publish.parent_container_id) {
     return { outcome: "waiting-children" };
   }
-  if (!listing.caption) {
-    await failListing(deps, listing, "listing has no caption — cannot create carousel");
+  // Carousel parent creation is a read-then-act: two children finishing at
+  // once both see allDone + no parent and would each create a parent.
+  // Claim the step first (the publish worker released its lease when it
+  // enqueued the polls, so the first child claims); the loser requeues and
+  // re-checks — if the winner created the parent it sees it and waits, and
+  // if the winner crashed it creates the parent itself.
+  const claim = await deps.claimListing(listingId);
+  if (!claim) return { outcome: "missing" };
+  if (claim.alreadyPublished) {
+    if (claim.doc.publish.media_id) {
+      return finalizePublished(deps, claim.doc, claim.doc.publish.media_id);
+    }
+    return { outcome: "already-published" };
+  }
+  if (!claim.claimed) {
+    return requeueBackoff(deps, listing, payload, "carousel parent claim held by another worker");
+  }
+  const claimed = claim.doc;
+  // Re-check on the claimed (fresh) doc: the sibling may have created the
+  // parent since this snapshot was read.
+  if (claimed.publish.parent_container_id) {
+    await deps.saveListing(listingId, {
+      publish: { ...claimed.publish, locked_until: null },
+    });
+    return { outcome: "waiting-children" };
+  }
+  if (!claimed.caption) {
+    await failListing(deps, claimed, "listing has no caption — cannot create carousel");
     return { outcome: "failed", error: "missing caption" };
   }
   try {
     await liveSettings(deps);
-    const parent = await meta.createCarouselContainer(ids, listing.caption);
+    const parent = await meta.createCarouselContainer(ids, claimed.caption);
     await deps.saveListing(listingId, {
       publish: {
         parent_container_id: parent,
         container_status: { [parent]: "IN_PROGRESS" },
+        // Release the lease: the parent poll must be able to claim the
+        // media_publish step.
+        locked_until: null,
       },
     });
     await deps.enqueuePoll(
@@ -255,7 +284,7 @@ async function handleFinished(
     return { outcome: "parent-created" };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    await failListing(deps, listing, msg);
+    await failListing(deps, claimed, msg);
     return { outcome: "failed", error: msg };
   }
 }

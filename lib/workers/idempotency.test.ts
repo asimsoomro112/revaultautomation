@@ -280,6 +280,25 @@ describe("idempotency — duplicate deliveries publish exactly once", () => {
     expect(state.dms).toHaveLength(1); // exactly one seller permalink DM
   });
 
+  it("concurrent duplicate child polls → single carousel parent", async () => {
+    const r1 = await handlePublish("lst1", deps);
+    expect(r1.outcome).toBe("containers-created");
+    const [c1, c2] = state.polls as [PollContainerPayload, PollContainerPayload];
+    // Both children are FINISHED (both polls re-read after both status
+    // saves): both reach the parent-creation decision at once.
+    const listing = state.listings.get("lst1")!;
+    for (const id of listing.publish.container_ids) {
+      listing.publish.container_status[id] = "FINISHED";
+    }
+    const [a, b] = await Promise.all([
+      handlePollContainer({ ...c1! }, deps),
+      handlePollContainer({ ...c2! }, deps),
+    ]);
+    expect(state.meta.calls.createCarousel).toBe(1);
+    expect([a.outcome, b.outcome]).toContain("parent-created");
+    expect(state.polls.filter((p) => p.role === "parent")).toHaveLength(1);
+  });
+
   it("crash between media_publish and the PUBLISHED write recovers without a second media_publish", async () => {
     const listing = state.listings.get("lst1")!;
     listing.status = "PUBLISHING";
