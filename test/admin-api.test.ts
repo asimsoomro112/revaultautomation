@@ -47,6 +47,8 @@ const mocks = vi.hoisted(() => {
     }),
     appendListingEvent: vi.fn(async () => {}),
     notifyAdmin: vi.fn(async () => {}),
+    storeToken: vi.fn(async () => {}),
+    exchangeShortLivedToken: vi.fn(async () => ({ token: "long-lived-abc", expires_in: 5184000 })),
   };
 });
 
@@ -174,7 +176,10 @@ vi.mock("@/lib/ig-token", () => ({
   daysUntilExpiry: vi.fn(() => 10),
   markTokenDegraded: vi.fn(async () => {}),
   refreshLongLivedToken: vi.fn(async () => ({ token: "x", expires_at: "2026-12-01" })),
-  storeToken: vi.fn(async () => {}),
+  storeToken: mocks.storeToken,
+}));
+vi.mock("@/lib/tokens", () => ({
+  exchangeShortLivedToken: mocks.exchangeShortLivedToken,
 }));
 vi.mock("@/lib/publish-queue", () => ({
   enqueuePublishWorker: vi.fn(async () => true),
@@ -308,6 +313,44 @@ describe("GET /api/admin/sellers/banned", () => {
     expect(data.items[0]?.igsid).toBe("222");
     expect(data.items[0]?.reason).toBe("abuse");
     expect(data.items[1]?.igsid).toBe("111");
+  });
+});
+
+describe("POST /api/admin/token-save", () => {
+  it("exchanges the pasted short-lived token and stores the long-lived one with its real expiry", async () => {
+    mocks.exchangeShortLivedToken.mockResolvedValueOnce({ token: "long-lived-abc", expires_in: 5184000 });
+    const res = await POST(postReq("token-save", { token: "short-lived-token-xyz-1234567890" }), ctx(["token-save"]));
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as { ok: boolean; expires_at: string; days_left: number };
+    expect(data.ok).toBe(true);
+    expect(data.days_left).toBe(60);
+    // The STORED token is the exchanged long-lived one, not the pasted string.
+    expect(mocks.storeToken).toHaveBeenCalledWith("long-lived-abc", expect.any(String));
+    const days = (new Date(data.expires_at).getTime() - Date.now()) / 86400000;
+    expect(days).toBeGreaterThan(59);
+    expect(days).toBeLessThan(61);
+  });
+
+  it("returns 502 and stores nothing when Meta rejects the pasted token", async () => {
+    mocks.exchangeShortLivedToken.mockRejectedValueOnce(
+      new Error("Meta access_token exchange failed (400): Invalid OAuth access token"),
+    );
+    const res = await POST(
+      postReq("token-save", { token: "garbage-token-1234567890" }),
+      ctx(["token-save"]),
+    );
+    expect(res.status).toBe(502);
+    const data = (await res.json()) as { ok: boolean; error: string };
+    expect(data.ok).toBe(false);
+    expect(data.error).toMatch(/exchange failed/);
+    expect(mocks.storeToken).not.toHaveBeenCalled();
+    expect(mocks.updateAdminSettings).not.toHaveBeenCalled();
+  });
+
+  it("returns 400 for a too-short token", async () => {
+    const res = await POST(postReq("token-save", { token: "short" }), ctx(["token-save"]));
+    expect(res.status).toBe(400);
+    expect(mocks.exchangeShortLivedToken).not.toHaveBeenCalled();
   });
 });
 

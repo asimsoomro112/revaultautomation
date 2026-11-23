@@ -32,6 +32,7 @@ import {
   storeToken,
 } from "@/lib/ig-token";
 import { enqueuePublishWorker } from "@/lib/publish-queue";
+import { exchangeShortLivedToken } from "@/lib/tokens";
 import type { ListingDoc, ListingStatus } from "@/lib/types";
 
 const QUEUE_STATUSES: ListingStatus[] = [
@@ -628,12 +629,27 @@ async function handlePost(
     if (!parsed.success) {
       return NextResponse.json({ error: "Invalid token format" }, { status: 400 });
     }
-    // We assume the user pasted a short-lived token (expires in ~60 days, but actually we'll fetch the real expiry later or assume 60 days).
-    const expires_at = new Date(Date.now() + 60 * 24 * 3600 * 1000).toISOString();
-    await storeToken(parsed.data.token, expires_at);
+    // The pasted token is SHORT-LIVED (~1h from the Meta dashboard). Never
+    // store it as-is: exchange it for a 60-day long-lived token first, and
+    // store the exchanged token with Meta's real expires_in. Storing the
+    // pasted string with a fabricated 60-day expiry left the app believing
+    // it had a healthy token that actually died within the hour.
+    let exchanged: { token: string; expires_in: number };
+    try {
+      exchanged = await exchangeShortLivedToken(parsed.data.token);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      log.warn("admin-api: token exchange failed — nothing stored", { by, err: msg.slice(0, 200) });
+      return NextResponse.json(
+        { ok: false, error: `Token exchange failed: ${msg.slice(0, 200)}` },
+        { status: 502 },
+      );
+    }
+    const expires_at = new Date(Date.now() + exchanged.expires_in * 1000).toISOString();
+    await storeToken(exchanged.token, expires_at);
     await updateAdminSettings({ token_health: "ok" });
     log.info("admin-api: token saved manually from UI", { by });
-    return NextResponse.json({ ok: true, expires_at, days_left: 60 });
+    return NextResponse.json({ ok: true, expires_at, days_left: exchanged.expires_in / 86400 });
   }
 
   log.warn("admin-api: unknown POST path", { path: path.join("/") });
