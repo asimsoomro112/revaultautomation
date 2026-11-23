@@ -17,6 +17,7 @@ import PublishLog from "./components/PublishLog";
 import QuotaGauge from "./components/QuotaGauge";
 import KillSwitch from "./components/KillSwitch";
 import TokenHealth from "./components/TokenHealth";
+import LogoMark from "../components/LogoMark";
 import { adminFetch } from "./components/api";
 import styles from "./styles.module.css";
 
@@ -95,10 +96,11 @@ export default function AdminPage() {
     <div className={styles.page}>
       <header className={styles.header}>
         <div className={styles.logo}>
-          ReVault <span>Admin</span>
+          <LogoMark size={28} className={styles.logoMark} />
+          ReVault <span className={styles.logoAdmin}>Admin</span>
         </div>
         <div className={styles.userbox}>
-          <span>{user?.email}</span>
+          <span className={styles.userEmail}>{user?.email}</span>
           <button className={styles.btn} onClick={handleSignOut}>
             Sign out
           </button>

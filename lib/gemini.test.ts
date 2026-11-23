@@ -5,10 +5,11 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const generateContent = vi.fn();
+const listModels = vi.fn();
 
 vi.mock("@google/genai", () => {
   class GoogleGenAI {
-    models = { generateContent };
+    models = { generateContent, list: listModels };
     constructor(_opts: unknown) {
       // test double — ignores credentials
     }
@@ -18,7 +19,11 @@ vi.mock("@google/genai", () => {
 
 import { GeminiError, __testing__, getGeminiClient } from "./gemini";
 
-const { classifyGeminiError, resetClient, resolveModel, setExtractRetryDelays } = __testing__;
+const { classifyGeminiError, resetClient, resolveModel, resolveModels, setExtractRetryDelays } = __testing__;
+
+function modelOfCall(n: number): string {
+  return (generateContent.mock.calls[n]![0] as { model: string }).model;
+}
 
 function jsonReply(obj: unknown) {
   generateContent.mockResolvedValueOnce({ text: JSON.stringify(obj) });
@@ -29,6 +34,16 @@ beforeEach(() => {
   resetClient();
   process.env.GEMINI_API_KEY = "test_key";
   process.env.GEMINI_MODEL = "gemini-3.5-flash";
+  // The 2.5-fallback test below sets this; clear it so later tests see the default.
+  delete process.env.GEMINI_FALLBACK_MODELS;
+  // Live model list: by default every configured model is listed.
+  listModels.mockResolvedValue({
+    page: [
+      { name: "models/gemini-3.5-flash" },
+      { name: "models/gemini-3.6-flash" },
+      { name: "models/gemini-3-flash-preview" },
+    ],
+  });
 });
 
 describe("resolveModel guard", () => {
@@ -39,6 +54,29 @@ describe("resolveModel guard", () => {
   it("accepts gemini-3.5-flash", () => {
     process.env.GEMINI_MODEL = "gemini-3.5-flash";
     expect(resolveModel()).toBe("gemini-3.5-flash");
+  });
+});
+
+describe("resolveModels fallback chain", () => {
+  it("primary first, then fallbacks in order", () => {
+    process.env.GEMINI_MODEL = "gemini-3-flash-preview";
+    process.env.GEMINI_FALLBACK_MODELS = "gemini-3.6-flash, gemini-3.5-flash";
+    expect(resolveModels()).toEqual(["gemini-3-flash-preview", "gemini-3.6-flash", "gemini-3.5-flash"]);
+  });
+  it("dedupes the primary when it also appears in fallbacks", () => {
+    process.env.GEMINI_MODEL = "gemini-3.5-flash";
+    process.env.GEMINI_FALLBACK_MODELS = "gemini-3.6-flash,gemini-3.5-flash";
+    expect(resolveModels()).toEqual(["gemini-3.5-flash", "gemini-3.6-flash"]);
+  });
+  it("empty fallback list → primary only", () => {
+    process.env.GEMINI_MODEL = "gemini-3.5-flash";
+    process.env.GEMINI_FALLBACK_MODELS = "";
+    expect(resolveModels()).toEqual(["gemini-3.5-flash"]);
+  });
+  it("throws when a fallback is the retired gemini-2.5 family", () => {
+    process.env.GEMINI_MODEL = "gemini-3.5-flash";
+    process.env.GEMINI_FALLBACK_MODELS = "gemini-2.5-flash";
+    expect(() => resolveModels()).toThrow(/GEMINI_FALLBACK_MODELS/);
   });
 });
 
@@ -54,6 +92,26 @@ describe("classifyGeminiError", () => {
   it("passes GeminiError through unchanged", () => {
     const g = new GeminiError("x", false);
     expect(classifyGeminiError(g, "y")).toBe(g);
+  });
+});
+
+describe("live model list (ensureLiveChain)", () => {
+  it("keeps the configured chain when the live list fails", async () => {
+    listModels.mockRejectedValueOnce(new Error("network down"));
+    jsonReply({ intent: "SELLER_SUBMIT", confidence: 0.9, lang: "roman" });
+    const client = getGeminiClient();
+    const res = await client.classifyIntent("mujhe shirt bechni hai", []);
+    expect(res.intent).toBe("SELLER_SUBMIT");
+    expect(generateContent).toHaveBeenCalledOnce();
+    expect(modelOfCall(0)).toBe("gemini-3.5-flash");
+  });
+  it("asks the live list only once per client", async () => {
+    jsonReply({ intent: "OTHER", confidence: 0.5, lang: "en" });
+    jsonReply({ intent: "OTHER", confidence: 0.5, lang: "en" });
+    const client = getGeminiClient();
+    await client.classifyIntent("hi", []);
+    await client.classifyIntent("hi", []);
+    expect(listModels).toHaveBeenCalledOnce();
   });
 });
 
@@ -80,11 +138,32 @@ describe("getGeminiClient.classifyIntent", () => {
     expect(err.retryable).toBe(false);
   });
   it("network failure → GeminiError, retryable", async () => {
-    generateContent.mockRejectedValueOnce(new Error("fetch failed: socket hang up"));
+    // Persistent rejection: withFallback tries every model in the chain.
+    generateContent.mockRejectedValue(new Error("fetch failed: socket hang up"));
     const client = getGeminiClient();
     const err = await client.classifyIntent("hi", []).catch((e) => e);
     expect(err).toBeInstanceOf(GeminiError);
     expect(err.retryable).toBe(true);
+  });
+  it("falls back to the next model when the primary 503s", async () => {
+    process.env.GEMINI_FALLBACK_MODELS = "gemini-3.6-flash";
+    generateContent.mockRejectedValueOnce(new Error("503 overloaded"));
+    jsonReply({ intent: "SELLER_SUBMIT", confidence: 0.9, lang: "roman" });
+    const client = getGeminiClient();
+    const res = await client.classifyIntent("mujhe shirt bechni hai", []);
+    expect(res.intent).toBe("SELLER_SUBMIT");
+    expect(generateContent).toHaveBeenCalledTimes(2);
+    expect(modelOfCall(0)).toBe("gemini-3.5-flash");
+    expect(modelOfCall(1)).toBe("gemini-3.6-flash");
+  });
+  it("does NOT fall back on a non-retryable error", async () => {
+    process.env.GEMINI_FALLBACK_MODELS = "gemini-3.6-flash";
+    generateContent.mockRejectedValueOnce(new Error("401 invalid api key"));
+    const client = getGeminiClient();
+    const err = await client.classifyIntent("hi", []).catch((e) => e);
+    expect(err).toBeInstanceOf(GeminiError);
+    expect(err.retryable).toBe(false);
+    expect(generateContent).toHaveBeenCalledOnce();
   });
 });
 
@@ -137,6 +216,33 @@ describe("getGeminiClient.extractListing", () => {
     expect(res.extracted.category).toBe("blazer");
     expect(generateContent).toHaveBeenCalledTimes(2);
   });
+  it("falls back to the next model when the primary 503s", async () => {
+    setExtractRetryDelays([0, 0]);
+    process.env.GEMINI_FALLBACK_MODELS = "gemini-3.6-flash";
+    generateContent.mockRejectedValueOnce(new Error("503 overloaded"));
+    jsonReply(visionJson);
+    const client = getGeminiClient();
+    const res = await client.extractListing([Buffer.from("img")], "chat text", "roman");
+    expect(res.extracted.category).toBe("blazer");
+    expect(generateContent).toHaveBeenCalledTimes(2);
+    expect(modelOfCall(0)).toBe("gemini-3.5-flash");
+    expect(modelOfCall(1)).toBe("gemini-3.6-flash");
+  });
+  it("rotates through the chain when every attempt fails", async () => {
+    setExtractRetryDelays([0, 0]);
+    process.env.GEMINI_FALLBACK_MODELS = "gemini-3.6-flash";
+    generateContent.mockRejectedValue(new Error("503 overloaded"));
+    const client = getGeminiClient();
+    const err = await client.extractListing([Buffer.from("img")], "chat text", "roman").catch((e) => e);
+    expect(err).toBeInstanceOf(GeminiError);
+    expect(err.retryable).toBe(true);
+    expect(generateContent).toHaveBeenCalledTimes(3);
+    expect([modelOfCall(0), modelOfCall(1), modelOfCall(2)]).toEqual([
+      "gemini-3.5-flash",
+      "gemini-3.6-flash",
+      "gemini-3.5-flash",
+    ]);
+  });
   it("gives up after the retries are exhausted — still a retryable GeminiError", async () => {
     setExtractRetryDelays([0, 0]);
     generateContent.mockRejectedValue(new Error("503 overloaded"));
@@ -154,5 +260,17 @@ describe("getGeminiClient.extractListing", () => {
     expect(err).toBeInstanceOf(GeminiError);
     expect(err.retryable).toBe(false);
     expect(generateContent).toHaveBeenCalledOnce();
+  });
+  it("drops a configured model the live list no longer has", async () => {
+    setExtractRetryDelays([0, 0]);
+    process.env.GEMINI_FALLBACK_MODELS = "gemini-3.6-flash";
+    // Primary retired: the live list has only the fallback.
+    listModels.mockResolvedValueOnce({ page: [{ name: "models/gemini-3.6-flash" }] });
+    jsonReply(visionJson);
+    const client = getGeminiClient();
+    const res = await client.extractListing([Buffer.from("img")], "chat text", "roman");
+    expect(res.extracted.category).toBe("blazer");
+    expect(generateContent).toHaveBeenCalledOnce();
+    expect(modelOfCall(0)).toBe("gemini-3.6-flash");
   });
 });

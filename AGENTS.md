@@ -23,11 +23,20 @@ Working rules for anyone (human or agent) touching this repo. Short on purpose.
 8. **PII:** redact phone/email/address at the log boundary (`lib/log.ts`).
    Meta CDN URLs are never persisted — download bytes to private Storage NOW.
 9. **Gemini:** model from `GEMINI_MODEL` env (default `gemini-3-flash-preview`,
-   verified working 2026-11-23 — `gemini-3.8-flash` returned 503 "high demand"
-   on every finalize that day). `extractListing` retries transient 503/429/5xx
-   in-line (2s, 4s backoff) before failing closed. **Never `gemini-2.5*`** —
-   `lib/gemini.ts` refuses it (family retires 2026-10-16). Re-verify the model
-   list at ai.google.dev/gemini-api/docs/models before changing the default.
+   verified working 2026-11-23 — `gemini-3.8-flash` AND `gemini-3.7-flash`
+   both returned 503 "high demand" that day). `extractListing` retries
+   transient 503/429/5xx in-line (2s, 4s backoff) ROTATING through the fallback
+   chain in `GEMINI_FALLBACK_MODELS` (default `gemini-3.6-flash,gemini-3.5-flash`
+   — both verified answering 2026-11-23; `gemini-3.1-pro-preview` has 0
+   free-tier quota on this key, so it is NOT a fallback). On first use per
+   serverless instance the client asks Google for the LIVE model list
+   (`ai.models.list`) and drops any configured model no longer listed; if the
+   list call fails, the configured chain is used unchanged. The list proves
+   existence, not health — a listed model can still 503; the rotation handles
+   that at call time. `classifyIntent`/`writeCaption`/`chatReply` try each
+   model once in order. **Never `gemini-2.5*`** — `lib/gemini.ts` refuses it
+   (family retires 2026-10-16). Re-verify the model list at
+   ai.google.dev/gemini-api/docs/models before changing the default.
 10. **Firestore deny-all** except the `admin` custom claim (`firestore.rules`).
     Photos live in **Cloudinary**, not Firebase: server-signed uploads into
     `revault/listings/` as `type: 'private'` assets; delivery via

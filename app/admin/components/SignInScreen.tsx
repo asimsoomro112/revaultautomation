@@ -3,6 +3,7 @@
 import { useState } from "react";
 import { GoogleAuthProvider, signInWithPopup } from "firebase/auth";
 import { getClientAuth } from "../firebase-client";
+import LogoMark from "../../components/LogoMark";
 import styles from "../styles.module.css";
 
 export default function SignInScreen({ configError }: { configError: string | null }) {
@@ -25,6 +26,7 @@ export default function SignInScreen({ configError }: { configError: string | nu
     <div className={styles.page}>
       <div className={styles.signinWrap}>
         <div className={styles.signinCard}>
+          <LogoMark size={44} className={styles.logoMark} />
           <h1>
             ReVault <span>Admin</span>
           </h1>

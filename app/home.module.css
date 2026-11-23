@@ -1,0 +1,174 @@
+/* Hallmark v2.0.0 · ReVault Console (custom) · genre: modern-minimal · job: show bot status, open the admin */
+
+.page {
+  min-height: 100vh;
+  min-height: 100dvh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--rv-bg);
+  color: var(--rv-text);
+  font-family: var(--rv-font-sans);
+  padding: 20px 16px;
+  position: relative;
+  box-sizing: border-box;
+}
+
+.page::before {
+  content: "";
+  position: absolute;
+  inset: 0 0 auto 0;
+  height: 320px;
+  background: radial-gradient(560px 260px at 50% -80px, rgb(34 197 94 / 0.08), transparent 70%);
+  pointer-events: none;
+}
+
+.card {
+  position: relative;
+  z-index: 1;
+  max-width: 520px;
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--rv-surface);
+  border: 1px solid var(--rv-border);
+  border-radius: 20px;
+  padding: 28px 20px 24px;
+}
+
+.logoRow {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 20px;
+}
+
+.logoMark {
+  color: var(--rv-accent);
+  flex-shrink: 0;
+}
+
+.title {
+  font-size: 26px;
+  font-weight: 700;
+  margin: 0;
+  letter-spacing: -0.02em;
+  color: var(--rv-text);
+}
+
+.titleAccent {
+  color: var(--rv-accent);
+}
+
+.subtitle {
+  font-size: 14px;
+  line-height: 1.6;
+  color: var(--rv-muted);
+  margin: 0 0 24px;
+}
+
+.link {
+  color: var(--rv-accent);
+  text-decoration: none;
+  font-weight: 600;
+}
+.link:hover {
+  text-decoration: underline;
+}
+
+.statusSection {
+  background: rgb(0 0 0 / 0.25);
+  border-radius: 14px;
+  padding: 18px;
+  margin-bottom: 24px;
+  border: 1px solid var(--rv-border);
+}
+
+.sectionTitle {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--rv-text);
+  margin: 0 0 14px;
+}
+
+.statusGrid {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.statusRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  font-size: 13px;
+  color: var(--rv-text-2);
+}
+
+.statusValue {
+  font-weight: 600;
+  white-space: nowrap;
+}
+.statusOk {
+  color: var(--rv-accent);
+}
+.statusBad {
+  color: var(--rv-red);
+}
+.statusUnknown {
+  color: var(--rv-muted);
+}
+
+.actions {
+  display: flex;
+  gap: 12px;
+}
+
+.primaryBtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  box-sizing: border-box;
+  min-height: 48px;
+  padding: 0 24px;
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--rv-accent-ink);
+  background: var(--rv-accent);
+  border: none;
+  border-radius: 12px;
+  text-decoration: none;
+  cursor: pointer;
+  transition: background-color var(--rv-dur) var(--rv-ease), transform var(--rv-dur) var(--rv-ease);
+}
+.primaryBtn:hover {
+  background: var(--rv-accent-hover);
+}
+.primaryBtn:active {
+  transform: scale(0.98);
+}
+
+.footer {
+  margin-top: 24px;
+  text-align: center;
+}
+
+.footerText {
+  font-size: 12px;
+  color: var(--rv-faint);
+}
+
+@media (min-width: 640px) {
+  .card {
+    padding: 40px 36px 32px;
+  }
+
+  .title {
+    font-size: 28px;
+  }
+
+  .statusSection {
+    padding: 20px 22px;
+  }
+}

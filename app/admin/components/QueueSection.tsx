@@ -60,7 +60,7 @@ function ListingCard({
         <table className={styles.kvTable}>
           <tbody>
             <tr><td>Title</td><td>{ex.title}</td></tr>
-            <tr><td>Category</td><td>{ex.category ?? "—"} · {ex.gender ?? "—"}</td></tr>
+            <tr><td>Category</td><td>{ex.category ?? "—"}, {ex.gender ?? "—"}</td></tr>
             <tr><td>Brand</td><td>{ex.brand ?? "—"}</td></tr>
             <tr><td>Color / Size</td><td>{ex.color ?? "—"} / {ex.size ?? "—"}</td></tr>
             <tr><td>Condition</td><td>{ex.condition ?? "—"}</td></tr>
@@ -153,12 +153,22 @@ function ListingCard({
         </button>
       </div>
       {err && <div className={styles.error}>{err}</div>}
-      <div className={styles.muted}>
-        Seller {item.seller} · {new Date(item.created_at).toLocaleString()}
+      <div className={styles.sellerLine}>
+        <span className={styles.sellerName}>Seller {item.seller}</span>
+        <span className={styles.sellerDate}>{new Date(item.created_at).toLocaleString()}</span>
       </div>
     </div>
   );
 }
+
+const STATUS_LABELS: Record<string, string> = {
+  NEEDS_REVIEW: "Needs review",
+  QUEUED: "Queued",
+  SUBMITTED: "Submitted",
+  APPROVED: "Approved",
+  PUBLISHING: "Publishing",
+  FAILED: "Failed",
+};
 
 export default function QueueSection() {
   const [items, setItems] = useState<QueueItem[] | null>(null);
@@ -178,21 +188,37 @@ export default function QueueSection() {
     load();
   }, [load]);
   return (
-    <section className={styles.section}>
-      <h2 className={styles.sectionTitle}>
-        Review queue {items ? `(${items.length})` : ""}
-        <button
-          className={styles.btn}
-          style={{ marginLeft: 12 }}
-          onClick={load}
-        >
+    <section className={`${styles.section} ${styles.sectionFlat}`}>
+      <div className={styles.sectionHead}>
+        <h2 className={styles.sectionTitle}>
+          Review queue {items ? `(${items.length})` : ""}
+        </h2>
+        <button className={styles.btn} onClick={load}>
           Refresh
         </button>
-      </h2>
+      </div>
       {error && <div className={styles.alert}>{error}</div>}
       {items === null && !error && <div className={styles.muted}>Loading…</div>}
       {items !== null && items.length === 0 && (
-        <div className={styles.empty}>Queue is clear — nothing needs review. 🎉</div>
+        <div className={styles.empty}>Queue is clear — nothing needs review.</div>
+      )}
+      {items !== null && items.length > 0 && (
+        <div className={styles.summary}>
+          <span className={styles.summaryItem}>
+            <span className={styles.summaryCount}>{items.length}</span>
+            <span className={styles.summaryLabel}>Total</span>
+          </span>
+          {Object.entries(STATUS_LABELS).map(([status, label]) => {
+            const n = items.filter((i) => i.status === status).length;
+            if (n === 0) return null;
+            return (
+              <span key={status} className={styles.summaryItem}>
+                <span className={styles.summaryCount}>{n}</span>
+                <span className={styles.summaryLabel}>{label}</span>
+              </span>
+            );
+          })}
+        </div>
       )}
       <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
         {(items ?? []).map((item) => (

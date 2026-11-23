@@ -82,22 +82,30 @@ export default function TokenHealth() {
           </button>
         </div>
       )}
+      {health && health.days_left != null && (
+        <div className={styles.tokenBar}>
+          <div
+            className={`${styles.tokenFill} ${
+              health.days_left < 2 ? styles.tokenFillBad : health.days_left < 7 ? styles.tokenFillWarn : ""
+            }`}
+            style={{ width: `${Math.min(100, Math.max(0, (health.days_left / 60) * 100))}%` }}
+          />
+        </div>
+      )}
       {!health && !error && <div className={styles.muted}>Loading…</div>}
-      
-      <div style={{ marginTop: 20, display: "flex", gap: 10, alignItems: "center" }}>
-        <input 
-          type="text" 
-          placeholder="Paste new Instagram token here..." 
-          value={newToken} 
+
+      <div className={styles.tokenRow}>
+        <input
+          type="text"
+          placeholder="Paste new Instagram token here..."
+          value={newToken}
           onChange={(e) => setNewToken(e.target.value)}
-          className={styles.textarea}
-          style={{ minHeight: "unset", padding: "10px 14px", height: 40, flex: 1 }}
+          className={styles.input}
         />
-        <button 
-          className={`${styles.btn} ${styles.btnApprove}`} 
-          onClick={save} 
+        <button
+          className={`${styles.btn} ${styles.btnApprove}`}
+          onClick={save}
           disabled={busy || !newToken.trim()}
-          style={{ height: 40 }}
         >
           {busy ? "Saving..." : "Save Token"}
         </button>

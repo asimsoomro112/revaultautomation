@@ -6,6 +6,24 @@
  * every finalize that day, while gemini-3-flash-preview answered fine).
  * NEVER the gemini-2.5 family (retires 2026-10-16) — guarded at client creation.
  *
+ * Fallback chain (2026-11-23): when the primary model fails with a retryable
+ * error, the client tries the next model in GEMINI_FALLBACK_MODELS instead of
+ * hammering the same overloaded model. Default chain, verified live against
+ * the project's key the same day:
+ *   gemini-3-flash-preview → gemini-3.6-flash → gemini-3.5-flash
+ * (gemini-3.8-flash still 503s with "high demand"; gemini-3.7-flash 503s too;
+ * gemini-3.1-pro-preview has 0 free-tier quota on this key, so none of them
+ * belongs in the default chain.)
+ * extractListing rotates models across its retry budget; the other methods try
+ * each model once in order on retryable errors.
+ *
+ * Live check: on first use (once per serverless instance) the client asks
+ * Google for the live model list (ai.models.list) and drops any configured
+ * model that is no longer listed — a retired model never wastes an attempt.
+ * The list only proves existence, not health (a listed model can still 503);
+ * health at call time is handled by the rotation above. If the list call
+ * fails, the configured chain is used unchanged.
+ *
  * Structured output: the installed SDK (v2.x) routes raw JSON schemas through
  * `config.responseJsonSchema` (see GenerateContentConfig in the SDK .d.ts;
  * data placed in `responseSchema` is auto-moved there since v1.9.0). We pass
@@ -213,12 +231,32 @@ const visionJsonSchema = {
 
 function resolveModel(): string {
   const model = getEnv().GEMINI_MODEL;
+  assertNotRetired(model, "GEMINI_MODEL");
+  return model;
+}
+
+function assertNotRetired(model: string, varName: string): void {
   if (model.startsWith("gemini-2.5")) {
     throw new Error(
-      `Refusing to use retired model family: GEMINI_MODEL=${model} (gemini-2.5 retires 2026-10-16). Set GEMINI_MODEL to a supported model, e.g. gemini-3-flash-preview.`,
+      `Refusing to use retired model family: ${varName}=${model} (gemini-2.5 retires 2026-10-16). Set ${varName} to a supported model, e.g. gemini-3-flash-preview.`,
     );
   }
-  return model;
+}
+
+/**
+ * The model chain: primary first, then each GEMINI_FALLBACK_MODELS entry
+ * (comma-separated), deduped, empties dropped. Every entry is guarded
+ * against the retired gemini-2.5 family.
+ */
+function resolveModels(): string[] {
+  const chain = [resolveModel()];
+  for (const entry of getEnv().GEMINI_FALLBACK_MODELS.split(",")) {
+    const model = entry.trim();
+    if (!model || chain.includes(model)) continue;
+    assertNotRetired(model, "GEMINI_FALLBACK_MODELS");
+    chain.push(model);
+  }
+  return chain;
 }
 
 /** Map unknown SDK/network errors to GeminiError with a retryable flag. */
@@ -245,49 +283,133 @@ function parseJsonResponse(text: string | undefined, context: string): unknown {
 
 class GeminiClientImpl implements GeminiClient {
   private readonly ai: GoogleGenAI;
-  private readonly model: string;
+  /** Model chain, primary first. Every call rotates through it on retryable errors. */
+  private models: string[];
+  /** Cached live-list refresh: one list() call per client lifetime. */
+  private liveChainPromise: Promise<void> | null = null;
 
-  constructor(apiKey: string, model: string) {
+  constructor(apiKey: string, models: string[]) {
     this.ai = new GoogleGenAI({ apiKey });
-    this.model = model;
+    this.models = models;
+  }
+
+  /**
+   * Ask Google for the live model list and drop configured models that are
+   * no longer listed (retired/removed). Runs once per client lifetime — the
+   * client is rebuilt on every serverless cold start, so the check is fresh
+   * often enough without a list() round-trip on every DM. Any failure (no
+   * list method, network error, empty page) keeps the configured chain.
+   */
+  private ensureLiveChain(): Promise<void> {
+    if (!this.liveChainPromise) {
+      this.liveChainPromise = (async () => {
+        try {
+          const pager = await this.ai.models.list({ config: { pageSize: 100 } });
+          const live = new Set<string>();
+          for (const m of pager.page ?? []) {
+            if (!m.name) continue;
+            // Only models that can generate content are usable fallbacks.
+            if (m.supportedActions && !m.supportedActions.includes("generateContent")) continue;
+            live.add(m.name.replace(/^models\//, ""));
+          }
+          if (live.size === 0) {
+            log.warn("Gemini live model list empty — keeping configured chain", { models: this.models });
+            return;
+          }
+          const kept = this.models.filter((m) => live.has(m));
+          if (kept.length === 0) {
+            log.warn("Gemini live model list has none of the configured models — keeping configured chain", {
+              models: this.models,
+            });
+            return;
+          }
+          const dropped = this.models.filter((m) => !live.has(m));
+          if (dropped.length > 0) {
+            log.warn("Gemini live model list: dropping retired models", { dropped, models: kept });
+          }
+          this.models = kept;
+        } catch (err) {
+          log.warn("Gemini live model list failed — keeping configured chain", {
+            error: err instanceof Error ? err.message.slice(0, 200) : String(err).slice(0, 200),
+          });
+        }
+      })();
+    }
+    return this.liveChainPromise;
+  }
+
+  /**
+   * Model for an attempt index, rotating through the chain. The chain is
+   * never empty (resolveModels always returns at least the primary).
+   */
+  private modelAt(attempt: number): string {
+    return this.models[attempt % this.models.length] ?? this.models[0]!;
+  }
+
+  /**
+   * Run `run` against the chain: primary first, then each fallback, on
+   * retryable errors. Non-retryable errors throw immediately; the last
+   * model's retryable error is thrown when the chain is exhausted.
+   */
+  private async withFallback<T>(run: (model: string) => Promise<T>, context: string): Promise<T> {
+    await this.ensureLiveChain();
+    let lastErr: GeminiError | null = null;
+    for (const model of this.models) {
+      try {
+        return await run(model);
+      } catch (err) {
+        const mapped = classifyGeminiError(err, context);
+        if (!mapped.retryable) throw mapped;
+        lastErr = mapped;
+        log.warn(`${context}: ${model} failed — trying next model`, {
+          model,
+          error: mapped.message.slice(0, 200),
+        });
+      }
+    }
+    throw lastErr ?? new GeminiError(`${context}: no models in chain`, false);
   }
 
   private async structured<T>(prompt: string, schema: unknown, zodSchema: z.ZodType<T>, context: string): Promise<T> {
-    try {
-      const res = await this.ai.models.generateContent({
-        model: this.model,
-        contents: prompt,
-        config: {
-          responseMimeType: "application/json",
-          responseJsonSchema: schema,
-          temperature: 0.2,
-        },
-      });
-      const json = parseJsonResponse(res.text, context);
-      const parsed = zodSchema.safeParse(json);
-      if (!parsed.success) {
-        const issues = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
-        throw new GeminiError(`${context}: schema validation failed — ${issues.slice(0, 400)}`, false);
+    return this.withFallback(async (model) => {
+      try {
+        const res = await this.ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: {
+            responseMimeType: "application/json",
+            responseJsonSchema: schema,
+            temperature: 0.2,
+          },
+        });
+        const json = parseJsonResponse(res.text, context);
+        const parsed = zodSchema.safeParse(json);
+        if (!parsed.success) {
+          const issues = parsed.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ");
+          throw new GeminiError(`${context}: schema validation failed — ${issues.slice(0, 400)}`, false);
+        }
+        return parsed.data;
+      } catch (err) {
+        throw classifyGeminiError(err, context);
       }
-      return parsed.data;
-    } catch (err) {
-      throw classifyGeminiError(err, context);
-    }
+    }, context);
   }
 
   private async text(prompt: string, context: string, temperature = 0.7): Promise<string> {
-    try {
-      const res = await this.ai.models.generateContent({
-        model: this.model,
-        contents: prompt,
-        config: { temperature, maxOutputTokens: 1024 },
-      });
-      const out = res.text?.trim();
-      if (!out) throw new GeminiError(`${context}: empty response from model`, true);
-      return out;
-    } catch (err) {
-      throw classifyGeminiError(err, context);
-    }
+    return this.withFallback(async (model) => {
+      try {
+        const res = await this.ai.models.generateContent({
+          model,
+          contents: prompt,
+          config: { temperature, maxOutputTokens: 1024 },
+        });
+        const out = res.text?.trim();
+        if (!out) throw new GeminiError(`${context}: empty response from model`, true);
+        return out;
+      } catch (err) {
+        throw classifyGeminiError(err, context);
+      }
+    }, context);
   }
 
   async classifyIntent(text: string, history: string[]): Promise<IntentResult> {
@@ -303,13 +425,16 @@ class GeminiClientImpl implements GeminiClient {
     parts.push({ text: visionPrompt(chatText, lang) });
     // Transient Gemini outages (503 overload, 429, 5xx, network blips) must
     // NOT fail a listing closed on the first spike: retry in-line with
-    // backoff, and only fail-closed (via the caller's catch) when the error
-    // is non-retryable or the retries are exhausted — by then the outage is
-    // real, not a spike.
+    // backoff, ROTATING through the fallback chain (attempt 1 = primary,
+    // attempt 2 = first fallback, ...). Only fail-closed (via the caller's
+    // catch) when the error is non-retryable or the retries are exhausted —
+    // by then the outage is real, not a spike.
+    await this.ensureLiveChain();
     for (let attempt = 0; ; attempt++) {
+      const model = this.modelAt(attempt);
       try {
         const res = await this.ai.models.generateContent({
-          model: this.model,
+          model,
           contents: parts as never,
           config: {
             responseMimeType: "application/json",
@@ -333,8 +458,10 @@ class GeminiClientImpl implements GeminiClient {
         const mapped = classifyGeminiError(err, "extractListing");
         const delayMs = extractRetryDelaysMs[attempt];
         if (!mapped.retryable || delayMs === undefined) throw mapped;
-        log.warn("extractListing: transient Gemini error — retrying", {
+        log.warn("extractListing: transient Gemini error — retrying with next model", {
           attempt: attempt + 1,
+          model,
+          next_model: this.modelAt(attempt + 1),
           delay_ms: delayMs,
           error: mapped.message.slice(0, 200),
         });
@@ -373,13 +500,13 @@ Max 2200 chars. No seller personal info. Output ONLY the caption.`;
 
 let cachedClient: GeminiClient | null = null;
 
-/** Singleton. Reads GEMINI_API_KEY + GEMINI_MODEL from env; guards the 2.5 family. */
+/** Singleton. Reads GEMINI_API_KEY + model chain from env; guards the 2.5 family. */
 export function getGeminiClient(): GeminiClient {
   if (!cachedClient) {
     const env = requireGeminiEnv();
-    const model = resolveModel();
-    log.info("Gemini client initialized", { model });
-    cachedClient = new GeminiClientImpl(env.GEMINI_API_KEY as string, model);
+    const models = resolveModels();
+    log.info("Gemini client initialized", { model: models[0], models });
+    cachedClient = new GeminiClientImpl(env.GEMINI_API_KEY as string, models);
   }
   return cachedClient;
 }
@@ -394,6 +521,7 @@ export const __testing__ = {
     extractRetryDelaysMs = [2000, 4000];
   },
   resolveModel,
+  resolveModels,
   classifyGeminiError,
   intentJsonSchema,
   visionJsonSchema,

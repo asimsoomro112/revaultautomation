@@ -53,6 +53,7 @@ describe("getEnv defaults", () => {
     expect(env.COVER_SLIDE_ENABLED).toBe(false);
     expect(env.IG_API_VERSION).toBe("v26.0");
     expect(env.GEMINI_MODEL).toBe("gemini-3-flash-preview");
+    expect(env.GEMINI_FALLBACK_MODELS).toBe("gemini-3.6-flash,gemini-3.5-flash");
     expect(env.APP_BASE_URL).toBe("http://localhost:3000");
   });
 

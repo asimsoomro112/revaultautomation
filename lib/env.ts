@@ -23,6 +23,8 @@ const envSchema = z.object({
   // --- Gemini ---
   GEMINI_API_KEY: z.string().optional(),
   GEMINI_MODEL: z.string().default("gemini-3-flash-preview"),
+  /** Comma-separated fallback models, tried in order after the primary. */
+  GEMINI_FALLBACK_MODELS: z.string().default("gemini-3.6-flash,gemini-3.5-flash"),
 
   // --- Firebase Admin SDK ---
   FIREBASE_PROJECT_ID: z.string().optional(),

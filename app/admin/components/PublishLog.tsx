@@ -31,19 +31,19 @@ export default function PublishLog() {
 
   return (
     <section className={styles.section}>
-      <h2 className={styles.sectionTitle}>
-        Publish log{" "}
-        <button className={styles.btn} style={{ marginLeft: 12 }} onClick={load}>
+      <div className={styles.sectionHead}>
+        <h2 className={styles.sectionTitle}>Publish log</h2>
+        <button className={styles.btn} onClick={load}>
           Refresh
         </button>
-      </h2>
+      </div>
       {error && <div className={styles.alert}>{error}</div>}
       {rows === null && !error && <div className={styles.muted}>Loading…</div>}
       {rows !== null && rows.length === 0 && (
         <div className={styles.empty}>No published listings yet.</div>
       )}
       {rows !== null && rows.length > 0 && (
-        <div style={{ overflowX: "auto" }}>
+        <div className={styles.tableWrap}>
           <table className={styles.logTable}>
             <thead>
               <tr>
@@ -61,7 +61,7 @@ export default function PublishLog() {
                   <td>
                     {r.permalink ? (
                       <a href={r.permalink} target="_blank" rel="noreferrer">
-                        open ↗
+                        Open
                       </a>
                     ) : (
                       "—"

@@ -50,12 +50,12 @@ export default function KillSwitch() {
       {error && <div className={styles.alert}>{error}</div>}
       <div className={styles.killWrap}>
         <div>
-          <div className={styles.killState}>
-            {settings ? (settings.kill_switch ? "🛑 ENABLED" : "🟢 Disabled") : "…"}
-          </div>
+          <span className={`${styles.killChip} ${settings?.kill_switch ? styles.killChipOn : styles.killChipOff}`}>
+            {settings ? (settings.kill_switch ? "Enabled" : "Disabled") : "…"}
+          </span>
           {settings && (
-            <div className={styles.muted} style={{ marginTop: 6 }}>
-              Mode: {settings.publish_mode} · window {settings.posting_window.start}–
+            <div className={styles.muted} style={{ marginTop: 8 }}>
+              Mode: {settings.publish_mode}, window {settings.posting_window.start}–
               {settings.posting_window.end} {settings.posting_window.tz}
             </div>
           )}
@@ -65,7 +65,7 @@ export default function KillSwitch() {
           onClick={toggle}
           disabled={busy || !settings}
         >
-          {busy ? "…" : settings?.kill_switch ? "DISABLE" : "ENABLE"}
+          {busy ? "…" : settings?.kill_switch ? "Disable" : "Enable"}
         </button>
       </div>
     </section>
