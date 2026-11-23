@@ -181,6 +181,7 @@ vi.mock("@/lib/publish-queue", () => ({
 }));
 
 import { GET, POST } from "@/app/api/admin/[[...path]]/route";
+import { enqueuePublishWorker } from "@/lib/publish-queue";
 
 function ctx(path: string[]) {
   return { params: Promise.resolve({ path }) };
@@ -307,6 +308,68 @@ describe("GET /api/admin/sellers/banned", () => {
     expect(data.items[0]?.igsid).toBe("222");
     expect(data.items[0]?.reason).toBe("abuse");
     expect(data.items[1]?.igsid).toBe("111");
+  });
+});
+
+describe("POST /api/admin/listings/:id/approve", () => {
+  const emptyReview = { note: null, decided_by: null, decided_at: null };
+
+  it("approves a NEEDS_REVIEW listing and enqueues the publish worker", async () => {
+    mocks.listingById.set("lst1", { status: "NEEDS_REVIEW", review: emptyReview });
+    const res = await POST(postReq("listings/lst1/approve", {}), ctx(["listings", "lst1", "approve"]));
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as { ok: boolean; status: string; enqueued: boolean };
+    expect(data).toMatchObject({ ok: true, status: "APPROVED", enqueued: true });
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "APPROVED" });
+  });
+
+  it("rolls back to NEEDS_REVIEW and returns 502 when the publish enqueue fails", async () => {
+    mocks.listingById.set("lst1", { status: "NEEDS_REVIEW", review: emptyReview });
+    vi.mocked(enqueuePublishWorker).mockResolvedValueOnce(false);
+    const res = await POST(postReq("listings/lst1/approve", {}), ctx(["listings", "lst1", "approve"]));
+    expect(res.status).toBe(502);
+    const data = (await res.json()) as { ok: boolean; error: string };
+    expect(data.ok).toBe(false);
+    expect(data.error).toMatch(/could not be enqueued/);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "NEEDS_REVIEW", review: emptyReview });
+    expect(mocks.appendListingEvent).toHaveBeenCalledWith(
+      "lst1",
+      "approve_enqueue_failed",
+      expect.objectContaining({ detail: expect.stringContaining("QStash") }),
+    );
+  });
+
+  it("returns 409 for a PUBLISHING listing", async () => {
+    mocks.listingById.set("lst1", { status: "PUBLISHING", review: emptyReview });
+    const res = await POST(postReq("listings/lst1/approve", {}), ctx(["listings", "lst1", "approve"]));
+    expect(res.status).toBe(409);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "PUBLISHING" });
+  });
+});
+
+describe("POST /api/admin/listings/:id/retry", () => {
+  it("re-queues a FAILED listing and enqueues the publish worker", async () => {
+    mocks.listingById.set("lst1", { status: "FAILED" });
+    const res = await POST(postReq("listings/lst1/retry", {}), ctx(["listings", "lst1", "retry"]));
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as { ok: boolean; status: string; enqueued: boolean };
+    expect(data).toMatchObject({ ok: true, status: "QUEUED", enqueued: true });
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "QUEUED" });
+  });
+
+  it("rolls back to FAILED and returns 502 when the publish enqueue fails", async () => {
+    mocks.listingById.set("lst1", { status: "FAILED" });
+    vi.mocked(enqueuePublishWorker).mockResolvedValueOnce(false);
+    const res = await POST(postReq("listings/lst1/retry", {}), ctx(["listings", "lst1", "retry"]));
+    expect(res.status).toBe(502);
+    const data = (await res.json()) as { ok: boolean; error: string };
+    expect(data.ok).toBe(false);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "FAILED" });
+    expect(mocks.appendListingEvent).toHaveBeenCalledWith(
+      "lst1",
+      "retry_enqueue_failed",
+      expect.objectContaining({ detail: expect.stringContaining("QStash") }),
+    );
   });
 });
 

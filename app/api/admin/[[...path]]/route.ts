@@ -412,6 +412,28 @@ async function handlePost(
     });
     await appendListingEvent(b, "approved", { by, detail: "Approved in /admin" });
     const enqueued = await enqueuePublishWorker(b);
+    if (!enqueued) {
+      // The worker was never enqueued: roll the listing back to its
+      // pre-approve status so the admin can approve again — otherwise it
+      // would strand in APPROVED with no UI path to re-enqueue (approve
+      // rejects APPROVED, retry requires FAILED).
+      await ref.update({
+        status: data.status,
+        review: data.review ?? { note: null, decided_by: null, decided_at: null },
+      });
+      await appendListingEvent(b, "approve_enqueue_failed", {
+        by,
+        detail: `Publish worker could not be enqueued (QStash) — listing left in ${data.status}`,
+      });
+      log.warn("admin-api: approve enqueue failed, rolled back", { listing: b, by, from: data.status });
+      return NextResponse.json(
+        {
+          ok: false,
+          error: `Publish worker could not be enqueued (QStash) — listing left in ${data.status}; try again`,
+        },
+        { status: 502 },
+      );
+    }
     log.info("admin-api: listing approved", { listing: b, by, enqueued });
     return NextResponse.json({ ok: true, status: "APPROVED", enqueued });
   }
@@ -492,6 +514,23 @@ async function handlePost(
     await ref.update({ status: "QUEUED", "publish.last_error": null });
     await appendListingEvent(b, "retry", { by, detail: "Re-queued from /admin" });
     const enqueued = await enqueuePublishWorker(b);
+    if (!enqueued) {
+      // Same strand as approve: a QUEUED listing with no worker enqueued
+      // would never publish. Roll back to FAILED so the admin can retry.
+      await ref.update({ status: "FAILED" });
+      await appendListingEvent(b, "retry_enqueue_failed", {
+        by,
+        detail: "Publish worker could not be enqueued (QStash) — listing left in FAILED",
+      });
+      log.warn("admin-api: retry enqueue failed, rolled back", { listing: b, by });
+      return NextResponse.json(
+        {
+          ok: false,
+          error: "Publish worker could not be enqueued (QStash) — listing left in FAILED; try again",
+        },
+        { status: 502 },
+      );
+    }
     log.info("admin-api: listing retried", { listing: b, by, enqueued });
     return NextResponse.json({ ok: true, status: "QUEUED", enqueued });
   }
