@@ -426,6 +426,17 @@ async function handlePost(
     const snap = await ref.get();
     if (!snap.exists) return NextResponse.json({ error: "Listing not found" }, { status: 404 });
     const data = snap.data() as ListingDoc;
+    // A PUBLISHING listing is mid-flight (containers created or
+    // media_publish in progress): rejecting it here would not stop the
+    // workers — the listing would end FAILED, not REJECTED, and the
+    // seller would get the wrong outcome. PUBLISHED is already live on
+    // IG (needs a delete flow, not a reject). REJECTED is terminal.
+    if (["PUBLISHING", "PUBLISHED", "REJECTED"].includes(data.status)) {
+      return NextResponse.json(
+        { error: `Cannot reject a listing in status ${data.status}` },
+        { status: 409 },
+      );
+    }
     await ref.update({
       status: "REJECTED",
       review: { note: parsed.data.reason, decided_by: by, decided_at: new Date().toISOString() },
@@ -448,6 +459,19 @@ async function handlePost(
     const ref = adminDb().collection("listings").doc(b);
     const snap = await ref.get();
     if (!snap.exists) return NextResponse.json({ error: "Listing not found" }, { status: 404 });
+    const data = snap.data() as ListingDoc;
+    // The caption is baked into the IG containers at publish time: editing
+    // a PUBLISHING listing's caption would be silently lost (containers
+    // already carry the old one), and a PUBLISHED listing's caption lives
+    // on IG now. DRAFT / NEEDS_INFO have no generated caption to edit yet.
+    // Allowlist (not blocklist): a future status defaults to "can't edit"
+    // rather than a silently-lost edit.
+    if (!["NEEDS_REVIEW", "CONFIRM", "SUBMITTED", "QUEUED", "APPROVED", "FAILED"].includes(data.status)) {
+      return NextResponse.json(
+        { error: `Cannot edit the caption of a listing in status ${data.status}` },
+        { status: 409 },
+      );
+    }
     await ref.update({ caption: parsed.data.caption });
     await appendListingEvent(b, "caption_edited", { by, detail: "Caption edited in /admin" });
     return NextResponse.json({ ok: true });

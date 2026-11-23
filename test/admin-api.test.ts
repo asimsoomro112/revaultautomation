@@ -35,6 +35,7 @@ const mocks = vi.hoisted(() => {
     blocklist: new Map<string, { reason: string; at: string; by: string }>(),
     conversations: new Map<string, Record<string, unknown>>(),
     listings: [] as Array<{ id: string; created_at: string }>,
+    listingById: new Map<string, Record<string, unknown>>(),
     events: [] as Array<{
       id: string;
       listingId: string;
@@ -85,24 +86,38 @@ vi.mock("@/lib/firebase-admin", () => {
         );
       }
       if (name === "listings") {
-        return orderLimitGet(
-          mocks.listings.map((l) => ({
-            id: l.id,
-            data: () => ({ created_at: l.created_at }),
-            ref: {
-              collection: (sub: string) => {
-                if (sub !== "events") throw new Error(`fakeDb listings ref.collection(${sub}) not stubbed`);
-                return orderLimitGet(
-                  mocks.events
-                    .filter((e) => e.listingId === l.id)
-                    .map((e) => ({ id: e.id, data: () => e.data })),
-                  (d) => (d.data() as { at: string }).at,
-                );
+        return {
+          ...orderLimitGet(
+            mocks.listings.map((l) => ({
+              id: l.id,
+              data: () => ({ created_at: l.created_at }),
+              ref: {
+                collection: (sub: string) => {
+                  if (sub !== "events") throw new Error(`fakeDb listings ref.collection(${sub}) not stubbed`);
+                  return orderLimitGet(
+                    mocks.events
+                      .filter((e) => e.listingId === l.id)
+                      .map((e) => ({ id: e.id, data: () => e.data })),
+                    (d) => (d.data() as { at: string }).at,
+                  );
+                },
               },
+            })),
+            (d) => (d.data() as { created_at: string }).created_at,
+          ),
+          // Doc-level access for the approve/reject/caption/retry endpoints.
+          doc: (id: string) => ({
+            get: async () => ({
+              exists: mocks.listingById.has(id),
+              data: () => mocks.listingById.get(id),
+            }),
+            update: async (patch: Record<string, unknown>) => {
+              const cur = mocks.listingById.get(id);
+              if (!cur) throw new Error(`fakeDb listings doc(${id}) missing`);
+              mocks.listingById.set(id, { ...cur, ...patch });
             },
-          })),
-          (d) => (d.data() as { created_at: string }).created_at,
-        );
+          }),
+        };
       }
       throw new Error(`fakeDb.collection(${name}) not stubbed`);
     },
@@ -187,6 +202,7 @@ beforeEach(() => {
   mocks.blocklist.clear();
   mocks.conversations.clear();
   mocks.listings.length = 0;
+  mocks.listingById.clear();
   mocks.events.length = 0;
   vi.clearAllMocks();
   // restore the shared settings object to the test-fakes defaults
@@ -291,6 +307,88 @@ describe("GET /api/admin/sellers/banned", () => {
     expect(data.items[0]?.igsid).toBe("222");
     expect(data.items[0]?.reason).toBe("abuse");
     expect(data.items[1]?.igsid).toBe("111");
+  });
+});
+
+describe("POST /api/admin/listings/:id/reject", () => {
+  it("rejects a NEEDS_REVIEW listing", async () => {
+    mocks.listingById.set("lst1", { status: "NEEDS_REVIEW", seller_igsid: "111" });
+    const res = await POST(
+      postReq("listings/lst1/reject", { reason: "stock photo" }),
+      ctx(["listings", "lst1", "reject"]),
+    );
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as { ok: boolean; status: string };
+    expect(data).toMatchObject({ ok: true, status: "REJECTED" });
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "REJECTED" });
+  });
+
+  it("returns 409 for a PUBLISHING listing — an in-flight publish must not be rejected", async () => {
+    mocks.listingById.set("lst1", { status: "PUBLISHING", seller_igsid: "111" });
+    const res = await POST(
+      postReq("listings/lst1/reject", { reason: "too late" }),
+      ctx(["listings", "lst1", "reject"]),
+    );
+    expect(res.status).toBe(409);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "PUBLISHING" });
+  });
+
+  it("returns 409 for a PUBLISHED listing", async () => {
+    mocks.listingById.set("lst1", { status: "PUBLISHED", seller_igsid: "111" });
+    const res = await POST(
+      postReq("listings/lst1/reject", { reason: "too late" }),
+      ctx(["listings", "lst1", "reject"]),
+    );
+    expect(res.status).toBe(409);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "PUBLISHED" });
+  });
+
+  it("returns 404 for a missing listing", async () => {
+    const res = await POST(
+      postReq("listings/nope/reject", { reason: "x" }),
+      ctx(["listings", "nope", "reject"]),
+    );
+    expect(res.status).toBe(404);
+  });
+});
+
+describe("POST /api/admin/listings/:id/caption", () => {
+  it("updates the caption of a CONFIRM listing", async () => {
+    mocks.listingById.set("lst1", { status: "CONFIRM", caption: "old" });
+    const res = await POST(
+      postReq("listings/lst1/caption", { caption: "new caption" }),
+      ctx(["listings", "lst1", "caption"]),
+    );
+    expect(res.status).toBe(200);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ caption: "new caption" });
+  });
+
+  it("returns 409 for a PUBLISHING listing — containers already carry the old caption", async () => {
+    mocks.listingById.set("lst1", { status: "PUBLISHING", caption: "old" });
+    const res = await POST(
+      postReq("listings/lst1/caption", { caption: "new" }),
+      ctx(["listings", "lst1", "caption"]),
+    );
+    expect(res.status).toBe(409);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ caption: "old" });
+  });
+
+  it("returns 409 for a PUBLISHED listing — the caption lives on IG now", async () => {
+    mocks.listingById.set("lst1", { status: "PUBLISHED", caption: "old" });
+    const res = await POST(
+      postReq("listings/lst1/caption", { caption: "new" }),
+      ctx(["listings", "lst1", "caption"]),
+    );
+    expect(res.status).toBe(409);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ caption: "old" });
+  });
+
+  it("returns 404 for a missing listing", async () => {
+    const res = await POST(
+      postReq("listings/nope/caption", { caption: "new" }),
+      ctx(["listings", "nope", "caption"]),
+    );
+    expect(res.status).toBe(404);
   });
 });
 
