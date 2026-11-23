@@ -93,6 +93,10 @@ Workflow: `.agents/workflows/verify.md` (lint → typecheck → test).
 - Don't send Telegram alerts that throw — `notifyAdmin` never throws by design.
 - Don't widen Firestore rules for convenience; use the admin claim.
 - Don't "fix" a failing test by weakening the assertion — fix the code.
+- Don't import JSX element objects out of a `"use client"` module into a
+  Server Component — they render nothing, silently (2026-11-23: the
+  dashboard home cards lost all icons). Keep shared icons/elements in a
+  plain module with no `"use client"` — see `app/admin/components/navIcons.tsx`.
 
 ## Claude audit fixes (2026-11-23)
 - **Test clock:** `sendSafe` (and any 24h-window check) must use the injected
