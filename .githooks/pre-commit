@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Pre-commit secret scan for the ReVault DM-to-Post bot.
+# Blocks commits containing likely secrets. Install with:
+#   git config core.hooksPath .githooks
+set -euo pipefail
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACM || true)
+[ -z "$STAGED" ] && exit 0
+
+fail() { echo "pre-commit BLOCKED: $1" >&2; exit 1; }
+
+# 1. Never commit env files or service-account JSON (.env.example is allowed).
+echo "$STAGED" | grep -vE '(^|/)\.env\.example$' | grep -qE '(^|/)\.env(\.|$)' && fail "real env file staged"
+echo "$STAGED" | grep -qiE 'service-account.*\.json$|-key\.json$' && fail "possible service-account key staged"
+
+# 2. Scan staged content for secret patterns (excluding this hooks dir,
+#    which necessarily names the patterns it looks for).
+PATTERNS='AIza[0-9A-Za-z_-]{35}|-----BEGIN (RSA )?PRIVATE KEY-----|sk_live_[0-9a-zA-Z]+|ghp_[0-9A-Za-z]{36}|xoxb-[0-9A-Za-z-]+|AKIA[0-9A-Z]{16}|AIzaSy'
+if git diff --cached -- . ':(exclude).githooks' | grep -nE "$PATTERNS" | grep -v '\.env\.example'; then
+  fail "secret-like pattern in staged diff (see lines above)"
+fi
+
+echo "pre-commit: secret scan clean"

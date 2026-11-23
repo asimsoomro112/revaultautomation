@@ -1,0 +1,13 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{db}/documents {
+    // Deny-all by default. The bot reads/writes exclusively through the
+    // Firebase Admin SDK (server), which bypasses these rules. The only
+    // client access permitted is for users carrying the custom claim
+    // admin == true (set by scripts/grant-admin.ts), used by /admin if it
+    // ever needs a direct client read in future. Nothing else gets in.
+    match /{document=**} {
+      allow read, write: if request.auth != null && request.auth.token.admin == true;
+    }
+  }
+}
