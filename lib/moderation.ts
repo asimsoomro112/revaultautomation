@@ -120,21 +120,29 @@ export async function applyModeration(
     }
 
     // 4. Per-image severe flags → FAIL.
-    for (const img of vm.per_image ?? []) {
+    // Vision must assess EVERY photo: an empty or short per_image array
+    // would make every per-image loop below a no-op, so a model that
+    // returns per_image: [] with verdict PASS would auto-pass an unexamined
+    // photo. Fail closed to REVIEW instead.
+    const perImage = vm.per_image ?? [];
+    if (listing.photos.length > 0 && perImage.length !== listing.photos.length) {
+      review("per_image_mismatch");
+    }
+    for (const img of perImage) {
       if (img.nudity_sexual) fail("nudity_sexual");
       if (img.minors) fail("minors");
       if (img.offensive_text) fail("offensive_text");
     }
 
     // 5. Suspicion flags → REVIEW (human eyes in /admin).
-    for (const img of vm.per_image ?? []) {
+    for (const img of perImage) {
       if (img.visible_faces) review("visible_faces");
       if (img.contact_info) review("contact_info_in_image");
       if (img.stock_or_stolen_suspicion) review("stock_or_stolen_suspicion");
     }
     if (vm.counterfeit_claim) review("counterfeit_claim");
     if (vm.text_contact_info) review("text_contact_info");
-    if ((vm.per_image ?? []).length > 0 && (vm.per_image ?? []).every((i) => !i.is_clothing)) {
+    if (perImage.length > 0 && perImage.every((i) => !i.is_clothing)) {
       review("no_clothing_detected");
     }
 

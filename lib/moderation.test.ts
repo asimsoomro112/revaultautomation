@@ -187,6 +187,44 @@ describe("applyModeration verdict matrix", () => {
   });
 });
 
+describe("applyModeration per-image coverage", () => {
+  // A model that returns per_image: [] (or fewer entries than photos) with
+  // verdict PASS must never auto-pass: every per-image safeguard below is a
+  // loop over per_image, so an empty/short array skips them all silently.
+  function twoPhotoListing(): ListingDoc {
+    const at = new Date().toISOString();
+    return makeListing({
+      photos: [
+        { storage_path: "raw/x/p1.jpg", w: 800, h: 1000, phash: PHASH_A, received_at: at },
+        { storage_path: "raw/x/p2.jpg", w: 800, h: 1000, phash: PHASH_A, received_at: at },
+      ],
+    });
+  }
+
+  it("empty per_image with verdict PASS → REVIEW per_image_mismatch", async () => {
+    const out = await applyModeration(makeListing(), makeVision({ per_image: [] }));
+    expect(out.verdict).toBe("REVIEW");
+    expect(out.reasons).toContain("per_image_mismatch");
+  });
+
+  it("short per_image (1 entry for 2 photos) → REVIEW per_image_mismatch", async () => {
+    const out = await applyModeration(
+      twoPhotoListing(),
+      makeVision({ per_image: [cleanPerImage()] }),
+    );
+    expect(out.verdict).toBe("REVIEW");
+    expect(out.reasons).toContain("per_image_mismatch");
+  });
+
+  it("per_image matching the photo count stays PASS", async () => {
+    const out = await applyModeration(
+      twoPhotoListing(),
+      makeVision({ per_image: [cleanPerImage({ photo_index: 0 }), cleanPerImage({ photo_index: 1 })] }),
+    );
+    expect(out).toEqual({ verdict: "PASS", reasons: [] });
+  });
+});
+
 describe("applyModeration duplicate detection", () => {
   it("exact dHash match on a DIFFERENT listing → REVIEW possible_duplicate", async () => {
     exactDup.mockResolvedValue({ phash: PHASH_A, listing_id: "listing_other", at: new Date().toISOString() });
