@@ -637,13 +637,22 @@ function appendChat(existing: string, text: string): string {
  * finalize that started before this text skips itself on the activity guard.
  */
 async function rearmFinalizeForText(deps: Deps, listing: ListingDoc, nowIso: string): Promise<void> {
-  if (listing.photos.length === 0) return;
+  // Re-read fresh: callers pass a snapshot read BEFORE their own
+  // last_activity_at bump, so a photo appended between that read and this
+  // call is invisible to the snapshot (photos.length === 0 → early return)
+  // while the bump already invalidated the photo's own armed finalize — the
+  // listing would sit unextracted forever, no DM, no alert (2026-11-24
+  // re-audit Lane C M5). The fresh read closes the straddle: the photo's
+  // append either precedes it (seen → arm F2) or follows it (the photo's
+  // own finalize then runs, since its append re-bumps activity last).
+  const fresh = (await deps.db.getListing(listing.id)) ?? listing;
+  if (fresh.photos.length === 0) return;
   await deps.enqueueWorker(
     "finalize-photos",
     {
       kind: "finalize-photos",
       listing_id: listing.id,
-      photo_at: listing.last_photo_at ?? nowIso,
+      photo_at: fresh.last_photo_at ?? nowIso,
       activity_at: nowIso,
     },
     {
@@ -888,7 +897,25 @@ async function handleText(deps: Deps, convo: ConversationDoc, text: string, nowI
       // single pending-question answer. NOT when the pending question is the
       // caption edit: a caption containing a "Key: value" line must be kept
       // verbatim, not parsed as field updates.
-      const pending = nextQuestion(pendingMissing(listing), convo.lang, listing.photos.length);
+      const missing = pendingMissing(listing);
+      if (missing.length === 0) {
+        // The listing is complete but still NEEDS_INFO (e.g. waiting on the
+        // photo-check defer): there is NO pending question, so routing this
+        // text as an answer would corrupt a field — nextQuestion([]) falls
+        // back to "category", and a plain "ok" / "theek hai" would become
+        // the category (2026-11-24 re-audit Lane C N-H2). Append the text
+        // to chat_text so extraction still sees it, re-arm finalize, and
+        // tell the seller to wait.
+        await deps.db.mutateListing(listing.id, (doc) => ({
+          patch: { chat_text: appendChat(doc.chat_text ?? "", text), last_activity_at: nowIso },
+          result: undefined,
+        }));
+        await rearmFinalizeForText(deps, listing, nowIso);
+        await persistConvo(deps, convo);
+        await sendSafe(deps, convo, { text: photoCheckHoldReply(convo.lang) });
+        break;
+      }
+      const pending = nextQuestion(missing, convo.lang, listing.photos.length);
       if (pending.field !== "caption") {
         const dump = parseDetailsDump(text);
         if (dump.length > 0 && (await applyDetailsDump(deps, convo, listing, text, dump))) break;

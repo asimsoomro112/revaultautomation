@@ -299,6 +299,29 @@ describe("handleMessage: NEEDS_INFO typed answers", () => {
     expect(deps.fdb.events.some((e) => e.event.type === "confirm")).toBe(false);
   });
 
+  it("text while waiting on the photo check (missing=[]) is NOT routed to a bogus category question", async () => {
+    const convo = await deps.db.getOrCreateConversation(IGSID);
+    const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
+    listing.status = "NEEDS_INFO";
+    listing.extracted = { ...fullTestExtracted(), category: "shirt", size: "M", condition: "like_new", price_pkr: 1500, city: "Karachi" };
+    listing.photos = [makePhoto("sellers/x/0.jpg"), makePhoto("sellers/x/1.jpg")];
+    listing.missing = [];
+    await deps.db.createListing(listing);
+    convo.state = "NEEDS_INFO";
+    convo.active_listing_id = "lst_1";
+
+    await handleMessage(payload("mid_5"), makeInbound("text", "mid_5", { text: "ok" }), deps);
+
+    const updated = deps.fdb.listings.get("lst_1")!;
+    expect(updated.extracted!.category).toBe("shirt"); // "ok" must NOT become the category
+    expect(updated.status).toBe("NEEDS_INFO");
+    expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
+    expect(updated.chat_text).toMatch(/ok/);
+    const sent = deps.meta.sent[deps.meta.sent.length - 1]!;
+    expect(sent.opts.text).toMatch(/wait karein|wait a moment|انتظار/);
+    expect(sent.opts.quickReplies).toBeUndefined(); // holding reply, no consent buttons
+  });
+
   it("multi-line details dump applies every field → CONFIRM (Nina, 2026-11-23)", async () => {
     const convo = await deps.db.getOrCreateConversation(IGSID);
     const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
@@ -406,6 +429,34 @@ describe("handleMessage: burst-combine — a details text re-arms finalize", () 
     const updated = deps.fdb.listings.get("lst_1")!;
     expect(updated.chat_text).toMatch(/hello, bechni hai/);
     expect(deps.enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(0);
+  });
+
+  it("photo landing between the handler's read and the re-arm still arms finalize (M5 straddle)", async () => {
+    const convo = await deps.db.getOrCreateConversation(IGSID);
+    const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
+    listing.status = "DRAFT";
+    listing.photos = [];
+    await deps.db.createListing(listing);
+    convo.state = "COLLECTING";
+    convo.active_listing_id = "lst_1";
+    convo.last_user_msg_at = NOW;
+    // The handler's first read (activeListing) sees 0 photos; the photo
+    // appends before the re-arm's read. The old code re-armed from the
+    // stale 0-photo snapshot and returned without arming F2, while the
+    // activity bump had already invalidated the photo's own armed finalize
+    // — the listing sat unextracted forever, no DM, no alert.
+    let calls = 0;
+    const origGet = deps.db.getListing;
+    deps.db.getListing = async (id) => {
+      const doc = await origGet(id);
+      calls++;
+      if (calls >= 2 && doc) {
+        return { ...doc, photos: [makePhoto("sellers/x/0.jpg")], last_photo_at: NOW };
+      }
+      return doc;
+    };
+    await handleMessage(payload("mid_t"), makeInbound("text", "mid_t", { text: "Brand: Grace" }), deps);
+    expect(deps.enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(1);
   });
 });
 
