@@ -197,6 +197,114 @@ describe("handleFinalizePhotos: burst-combine — activity during extraction", (
   });
 });
 
+describe("handleFinalizePhotos: stale-run hardening", () => {
+  // Same "later" timestamp the re-arm suite uses (its LATE is scoped to its
+  // own describe block).
+  const LATE = "2026-09-30T17:06:00.000Z";
+
+  it("skips when the admin rejects the listing during extraction (stale run must not overwrite)", async () => {
+    await seedListing();
+    deps.gemini.extractListingImpl = async () => {
+      // Admin moves the listing to review while Gemini is thinking.
+      deps.fdb.listings.get("lst_1")!.status = "NEEDS_REVIEW";
+      return makeVisionResult();
+    };
+    const res = await handleFinalizePhotos(payload("lst_1", NOW, undefined, NOW), fdeps);
+    expect(res).toEqual({ ok: true, skipped: "status" });
+    const listing = deps.fdb.listings.get("lst_1")!;
+    expect(listing.status).toBe("NEEDS_REVIEW");
+    expect(listing.extracted).toBeNull();
+    expect(deps.fdb.events.some((e) => e.event.type === "finalized")).toBe(false);
+    expect(deps.meta.sent).toHaveLength(0);
+  });
+
+  it("at the re-arm cap, a photo arriving during extraction routes to review (never auto-confirm an unexamined photo)", async () => {
+    await seedListing();
+    deps.gemini.extractListingImpl = async () => {
+      // A third photo lands while Gemini is thinking; the re-arm cap is hit.
+      await deps.db.mutateListing("lst_1", (doc) => ({
+        patch: {
+          photos: [...doc.photos, makePhoto("sellers/x/2.jpg")],
+          last_photo_at: LATE,
+          last_activity_at: LATE,
+        },
+        result: undefined,
+      }));
+      return makeVisionResult();
+    };
+    const res = await handleFinalizePhotos(
+      { kind: "finalize-photos", listing_id: "lst_1", photo_at: NOW, activity_at: NOW, rearm: 4 },
+      fdeps,
+    );
+    expect(res).toEqual({ ok: true });
+    const listing = deps.fdb.listings.get("lst_1")!;
+    expect(listing.status).toBe("NEEDS_REVIEW");
+    expect(deps.fdb.events.some((e) => e.event.type === "needs_review")).toBe(true);
+    expect(deps.fdb.events.some((e) => e.event.type === "confirm")).toBe(false);
+  });
+
+  it("finalized event carries the fresh photo count, not the pre-vision buffer count", async () => {
+    await seedListing();
+    deps.gemini.extractListingImpl = async () => {
+      await deps.db.mutateListing("lst_1", (doc) => ({
+        patch: {
+          photos: [...doc.photos, makePhoto("sellers/x/2.jpg")],
+          last_photo_at: LATE,
+          last_activity_at: LATE,
+        },
+        result: undefined,
+      }));
+      return makeVisionResult();
+    };
+    await handleFinalizePhotos(
+      { kind: "finalize-photos", listing_id: "lst_1", photo_at: NOW, activity_at: NOW, rearm: 4 },
+      fdeps,
+    );
+    const fin = deps.fdb.events.find((e) => e.event.type === "finalized");
+    expect(fin).toBeDefined();
+    expect(fin!.event.photo_count).toBe(3);
+  });
+
+  it("fail-closed convo save patches only the fields finalize owns (no stale full-doc overwrite)", async () => {
+    await seedListing();
+    mockApplyModeration.mockResolvedValue({ verdict: "FAIL", reasons: ["nudity_sexual"] });
+    const savedPatches: Array<Record<string, unknown>> = [];
+    const origSave = deps.db.saveConversation;
+    deps.db.saveConversation = async (igsid, patch) => {
+      savedPatches.push({ ...patch });
+      return origSave(igsid, patch);
+    };
+    await handleFinalizePhotos(payload("lst_1", NOW, undefined, NOW), fdeps);
+    expect(savedPatches.length).toBeGreaterThan(0);
+    for (const p of savedPatches) {
+      expect(Object.keys(p).sort()).toEqual(["active_listing_id", "state"]);
+    }
+  });
+
+  it("a transient-failure retry carries a deduplicationId and fresh activity_at", async () => {
+    await seedListing();
+    deps.gemini.extractListingImpl = async () => {
+      // A NEEDS_INFO answer bumps activity during the failed run without
+      // re-arming finalize — the retry must carry the fresh activity or it
+      // would skip as 'rearmed' and strand the listing.
+      await deps.db.mutateListing("lst_1", (_doc) => ({
+        patch: { last_activity_at: LATE },
+        result: undefined,
+      }));
+      throw new GeminiError("extractListing: boom", true);
+    };
+    const res = await handleFinalizePhotos(
+      { kind: "finalize-photos", listing_id: "lst_1", photo_at: NOW, activity_at: NOW, rearm: 1 },
+      fdeps,
+    );
+    expect(res).toEqual({ ok: true });
+    const retry = deps.enqueued.find((e) => e.route === "finalize-photos");
+    expect(retry).toBeDefined();
+    expect(retry!.payload).toMatchObject({ activity_at: LATE, attempt: 1, rearm: 1 });
+    expect(retry!.opts?.deduplicationId).toBe("finalize-retry-lst_1-1");
+  });
+});
+
 describe("handleFinalizePhotos: PASS branch", () => {
   it("complete extraction → CONFIRM + preview + consent buttons", async () => {
     await seedListing();

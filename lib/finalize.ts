@@ -60,7 +60,15 @@ async function markNeedsReview(
   await deps.db.appendListingEvent(listing.id, { type: "needs_review", note: note.slice(0, 300) });
   setConversationState(convo, "IDLE");
   convo.active_listing_id = null;
-  await deps.db.saveConversation(convo.igsid, { ...convo });
+  // Narrow patch of only the fields finalize owns: the convo was read
+  // before the vision call, so a full-doc save would clobber a seller
+  // message that arrived during extraction (last_user_msg_at, state,
+  // window_open). saveConversation is merge-based, so a partial patch
+  // only touches these two fields.
+  await deps.db.saveConversation(convo.igsid, {
+    state: convo.state,
+    active_listing_id: null,
+  });
   await deps.notifyAdmin(`🔍 Review needed — listing ${listing.id} (seller ${listing.seller_igsid}): ${note.slice(0, 200)}`, {
     listingId: listing.id,
     igsid: listing.seller_igsid,
@@ -177,14 +185,30 @@ export async function handleFinalizePhotos(
     // Quiet (or re-arm cap hit): this extraction covers the whole burst.
     // Branch on the fresh read so the photos/chat_text moderation sees are
     // the current ones, not the snapshot from before the vision call.
-    if (fresh) listing = fresh;
+    if (!fresh) {
+      // Listing deleted mid-run — a merge-save here would resurrect it.
+      log.warn("finalize.listing_gone", { listing_id: payload.listing_id });
+      return { ok: true, skipped: "listing_missing" };
+    }
+    listing = fresh;
+    // An admin decision (or the message worker) may have changed the listing
+    // while the seconds-long vision call was in flight. A stale run must not
+    // overwrite a REJECT/REVIEW decision, or move the listing to CONFIRM
+    // and DM consent buttons, after the fact.
+    if (!PROCESSABLE.has(fresh.status)) {
+      log.info("finalize.skipped_status_after_extraction", {
+        listing_id: listing.id,
+        status: fresh.status,
+      });
+      return { ok: true, skipped: "status" };
+    }
     listing.extracted = vision.extracted;
     listing.missing = vision.missing;
     // Narrow patch, not a full-doc save (see markNeedsReview).
     await deps.db.saveListing(listing.id, { extracted: vision.extracted, missing: vision.missing });
     await deps.db.appendListingEvent(listing.id, {
       type: "finalized",
-      photo_count: buffers.length,
+      photo_count: listing.photos.length,
       missing: vision.missing,
     });
 
@@ -219,9 +243,28 @@ export async function handleFinalizePhotos(
       await deps.db.appendListingEvent(listing.id, { type: "rejected", reasons: mod.reasons });
       setConversationState(convo, "IDLE");
       convo.active_listing_id = null;
-      await deps.db.saveConversation(convo.igsid, { ...convo });
+      // Narrow patch of only the fields finalize owns (see markNeedsReview).
+      await deps.db.saveConversation(convo.igsid, {
+        state: convo.state,
+        active_listing_id: null,
+      });
       const reason = mod.reasons[0] ?? "policy";
       await sendSafe(deps, convo, { text: politeReject(reason, convo.lang) });
+      return { ok: true };
+    }
+
+    // 4b. A photo arrived during the vision call (re-arm cap hit): it is in
+    // fresh.photos but was never in `buffers` — never visioned or moderated.
+    // Never auto-confirm a listing with an unexamined photo; route to human
+    // review instead. (A FAIL above still wins: the examined photos are
+    // already bad, so the listing is rejected outright.)
+    if (listing.photos.length > buffers.length) {
+      await markNeedsReview(
+        deps,
+        listing,
+        convo,
+        `photo arrived during extraction (re-arm cap) — ${listing.photos.length - buffers.length} photo(s) not visioned`,
+      );
       return { ok: true };
     }
 
@@ -238,7 +281,8 @@ export async function handleFinalizePhotos(
       // Narrow patch, not a full-doc save (see markNeedsReview).
       await deps.db.saveListing(listing.id, { status: "NEEDS_INFO", missing: check.missing });
       setConversationState(convo, "NEEDS_INFO");
-      await deps.db.saveConversation(convo.igsid, { ...convo });
+      // Narrow patch of only the field finalize owns (see markNeedsReview).
+      await deps.db.saveConversation(convo.igsid, { state: convo.state });
       const q = nextQuestion(check.missing, convo.lang, listing.photos.length);
       await sendSafe(deps, convo, q.quickReplies ? { text: q.question, quickReplies: q.quickReplies } : { text: q.question });
       return { ok: true };
@@ -265,17 +309,26 @@ export async function handleFinalizePhotos(
         attempt: attempt + 1,
         error: msg.slice(0, 200),
       });
+      // Re-read fresh photo/activity timestamps: activity may have moved
+      // during the failed run (e.g. a NEEDS_INFO answer bumps it without
+      // re-arming finalize). A retry carrying the stale payload would skip
+      // as "rearmed" and strand the listing. The dedup id keeps a duplicate
+      // delivery of this retry from running twice (AGENTS.md idempotency).
+      const freshRetry = await deps.db.getListing(listing.id);
       await deps.enqueueWorker(
         "finalize-photos",
         {
           kind: "finalize-photos",
           listing_id: listing.id,
-          photo_at: payload.photo_at,
-          activity_at: payload.activity_at,
+          photo_at: freshRetry?.last_photo_at ?? payload.photo_at,
+          activity_at: freshRetry?.last_activity_at ?? payload.activity_at,
           attempt: attempt + 1,
           rearm: payload.rearm,
         },
-        { delaySec: FINALIZE_RETRY_DELAY_SEC },
+        {
+          delaySec: FINALIZE_RETRY_DELAY_SEC,
+          deduplicationId: `finalize-retry-${listing.id}-${attempt + 1}`,
+        },
       );
       return { ok: true };
     }
