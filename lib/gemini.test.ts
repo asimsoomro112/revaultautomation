@@ -205,6 +205,9 @@ describe("getGeminiClient.extractListing", () => {
   });
   it("retries a transient 503 once, then succeeds", async () => {
     setExtractRetryDelays([0, 0]);
+    // The retry budget IS the chain: a lone model gets one attempt, so the
+    // retry here goes to the fallback model, not a re-hammer of the primary.
+    process.env.GEMINI_FALLBACK_MODELS = "gemini-3.6-flash";
     generateContent.mockRejectedValueOnce(
       new Error(
         '{"error":{"code":503,"message":"This model is currently experiencing high demand. Spikes in demand are usually temporary. Please try again later.","status":"UNAVAILABLE"}}',
@@ -215,6 +218,7 @@ describe("getGeminiClient.extractListing", () => {
     const res = await client.extractListing([Buffer.from("img")], "chat text", "roman");
     expect(res.extracted.category).toBe("blazer");
     expect(generateContent).toHaveBeenCalledTimes(2);
+    expect(modelOfCall(1)).toBe("gemini-3.6-flash");
   });
   it("falls back to the next model when the primary 503s", async () => {
     setExtractRetryDelays([0, 0]);
@@ -228,7 +232,7 @@ describe("getGeminiClient.extractListing", () => {
     expect(modelOfCall(0)).toBe("gemini-3.5-flash");
     expect(modelOfCall(1)).toBe("gemini-3.6-flash");
   });
-  it("rotates through the chain when every attempt fails", async () => {
+  it("tries each model in the chain exactly once when every attempt fails", async () => {
     setExtractRetryDelays([0, 0]);
     process.env.GEMINI_FALLBACK_MODELS = "gemini-3.6-flash";
     generateContent.mockRejectedValue(new Error("503 overloaded"));
@@ -236,15 +240,54 @@ describe("getGeminiClient.extractListing", () => {
     const err = await client.extractListing([Buffer.from("img")], "chat text", "roman").catch((e) => e);
     expect(err).toBeInstanceOf(GeminiError);
     expect(err.retryable).toBe(true);
-    expect(generateContent).toHaveBeenCalledTimes(3);
-    expect([modelOfCall(0), modelOfCall(1), modelOfCall(2)]).toEqual([
+    // 2-model chain → 2 attempts; the old fixed 3-attempt budget repeated
+    // the primary as a 3rd call.
+    expect(generateContent).toHaveBeenCalledTimes(2);
+    expect([modelOfCall(0), modelOfCall(1)]).toEqual([
       "gemini-3.5-flash",
       "gemini-3.6-flash",
-      "gemini-3.5-flash",
     ]);
+  });
+  it("tries a 4th fallback model when the chain has 4 models", async () => {
+    // 4 delays: the OLD budget was delays.length + 1, so [0,0,0] would have
+    // accidentally let the old code reach the 4th model too. With 4 delays
+    // the old code makes 5 calls (rotating back to the primary); the new
+    // budget is the chain, so exactly 4.
+    setExtractRetryDelays([0, 0, 0, 0]);
+    process.env.GEMINI_FALLBACK_MODELS = "gemini-3.6-flash,gemini-3-flash-preview,gemini-3.2-flash";
+    listModels.mockResolvedValue({
+      page: [
+        { name: "models/gemini-3.5-flash" },
+        { name: "models/gemini-3.6-flash" },
+        { name: "models/gemini-3-flash-preview" },
+        { name: "models/gemini-3.2-flash" },
+      ],
+    });
+    generateContent.mockRejectedValue(new Error("503 overloaded"));
+    const client = getGeminiClient();
+    const err = await client.extractListing([Buffer.from("img")], "chat text", "roman").catch((e) => e);
+    expect(err).toBeInstanceOf(GeminiError);
+    expect(generateContent).toHaveBeenCalledTimes(4);
+    expect([modelOfCall(0), modelOfCall(1), modelOfCall(2), modelOfCall(3)]).toEqual([
+      "gemini-3.5-flash",
+      "gemini-3.6-flash",
+      "gemini-3-flash-preview",
+      "gemini-3.2-flash",
+    ]);
+  });
+  it("a lone model gets exactly one attempt (no re-hammer)", async () => {
+    setExtractRetryDelays([0, 0]);
+    process.env.GEMINI_FALLBACK_MODELS = ""; // empty → chain is just the primary
+    generateContent.mockRejectedValue(new Error("503 overloaded"));
+    const client = getGeminiClient();
+    const err = await client.extractListing([Buffer.from("img")], "chat text", "roman").catch((e) => e);
+    expect(err).toBeInstanceOf(GeminiError);
+    expect(err.retryable).toBe(true);
+    expect(generateContent).toHaveBeenCalledTimes(1);
   });
   it("gives up after the retries are exhausted — still a retryable GeminiError", async () => {
     setExtractRetryDelays([0, 0]);
+    process.env.GEMINI_FALLBACK_MODELS = "gemini-3.6-flash,gemini-3-flash-preview";
     generateContent.mockRejectedValue(new Error("503 overloaded"));
     const client = getGeminiClient();
     const err = await client.extractListing([Buffer.from("img")], "chat text", "roman").catch((e) => e);

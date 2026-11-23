@@ -79,6 +79,8 @@ export class GeminiError extends Error {
  * returned 503 "high demand" on every finalize, and the old code fail-closed
  * each listing to NEEDS_REVIEW on the first failure. The retry loop sleeps
  * these delays between attempts; tests override them to 0 via __testing__.
+ * Delays beyond this array fall back to exponential backoff (2000·2^attempt,
+ * capped at 16s) so a chain longer than the array still backs off.
  */
 let extractRetryDelaysMs = [2000, 4000];
 
@@ -430,7 +432,12 @@ class GeminiClientImpl implements GeminiClient {
     // catch) when the error is non-retryable or the retries are exhausted —
     // by then the outage is real, not a spike.
     await this.ensureLiveChain();
-    for (let attempt = 0; ; attempt++) {
+    // The retry budget IS the chain: each model is tried exactly once.
+    // A fixed 3-attempt budget never tried a 4th fallback model, and
+    // re-tried a lone model 3 times. "Try again later" is the caller's
+    // job (finalize re-enqueues with backoff) — this loop only rotates.
+    const attempts = this.models.length;
+    for (let attempt = 0; attempt < attempts; attempt++) {
       const model = this.modelAt(attempt);
       try {
         const res = await this.ai.models.generateContent({
@@ -456,8 +463,9 @@ class GeminiClientImpl implements GeminiClient {
         };
       } catch (err) {
         const mapped = classifyGeminiError(err, "extractListing");
-        const delayMs = extractRetryDelaysMs[attempt];
-        if (!mapped.retryable || delayMs === undefined) throw mapped;
+        const isLast = attempt === attempts - 1;
+        if (!mapped.retryable || isLast) throw mapped;
+        const delayMs = extractRetryDelaysMs[attempt] ?? Math.min(2000 * 2 ** attempt, 16000);
         log.warn("extractListing: transient Gemini error — retrying with next model", {
           attempt: attempt + 1,
           model,
@@ -468,6 +476,9 @@ class GeminiClientImpl implements GeminiClient {
         await sleep(delayMs);
       }
     }
+    // Unreachable: the chain is never empty, so the loop always returns or
+    // throws. Kept for the type checker.
+    throw new GeminiError("extractListing: retry budget exhausted", true);
   }
 
   async writeCaption(extracted: ExtractedItem, lang: Lang, cta: "dm" | "site"): Promise<string> {
