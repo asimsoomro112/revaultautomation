@@ -8,7 +8,7 @@ export const dynamic = "force-dynamic";
 
 import { NextResponse } from "next/server";
 import { z } from "zod";
-import { verifyQStashSignatureRaw } from "@/lib/qstash";
+import { verifyQStashSignatureWithBody } from "@/lib/qstash";
 import { defaultWorkerDeps } from "@/lib/workers/common";
 import { handlePublish } from "@/lib/workers/publish";
 import { log } from "@/lib/log";
@@ -20,11 +20,7 @@ const payloadSchema = z.object({
 
 export async function POST(req: Request) {
   const raw = await req.text();
-  const okSig = await verifyQStashSignatureRaw({
-    signature: req.headers.get("upstash-signature"),
-    body: raw,
-    url: req.url,
-  });
+  const okSig = await verifyQStashSignatureWithBody(req, raw);
   if (!okSig) {
     return NextResponse.json({ error: "bad signature" }, { status: 401 });
   }

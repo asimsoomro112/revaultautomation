@@ -103,6 +103,35 @@ export async function verifyQStashSignature(req: Request): Promise<boolean> {
   }
 }
 
+/**
+ * Verify a QStash delivery when the route already read the raw body text.
+ * Rebuilds the signed URL from APP_BASE_URL — the same rule as
+ * verifyQStashSignature: req.url can differ behind Vercel/proxies (http vs
+ * https, host), and verifying against it silently 401s the worker.
+ * QStash does not retry 4xx, so the job is LOST with only a warn log and
+ * no error — exactly the silent-drop signature. All worker routes must use
+ * this (or verifyQStashSignature), never verifyQStashSignatureRaw with
+ * req.url directly.
+ */
+export async function verifyQStashSignatureWithBody(req: Request, rawText: string): Promise<boolean> {
+  try {
+    // Behind Vercel/ngrok/proxies req.url can differ (http vs https, host)
+    // from what QStash signed — rebuild it from APP_BASE_URL.
+    const { pathname, search } = new URL(req.url);
+    const url = `${appBaseUrl()}${pathname}${search}`;
+    return await verifyQStashSignatureRaw({
+      signature: req.headers.get("upstash-signature"),
+      body: rawText,
+      url,
+    });
+  } catch (err) {
+    log.warn("qstash signature verification failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
 /** Enqueue a worker invocation. Target URL is ${APP_BASE_URL}/api/workers/<route>. */
 export async function enqueueWorker(
   route: WorkerKind,

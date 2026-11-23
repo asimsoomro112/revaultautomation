@@ -17,7 +17,7 @@ import {
   saveInboundMessage,
 } from "@/lib/db";
 import { downloadImageToStorage } from "@/lib/storage";
-import { enqueueWorker, verifyQStashSignatureRaw } from "@/lib/qstash";
+import { enqueueWorker, verifyQStashSignatureWithBody } from "@/lib/qstash";
 import { processIngest, WorkerPayloadSchema } from "@/lib/ingest";
 
 export const dynamic = "force-dynamic";
@@ -26,11 +26,7 @@ export const runtime = "nodejs";
 export async function POST(req: Request): Promise<Response> {
   // Read the raw body ONCE — it feeds both signature verification and parsing.
   const rawText = await req.text();
-  const sigOk = await verifyQStashSignatureRaw({
-    signature: req.headers.get("upstash-signature"),
-    body: rawText,
-    url: req.url,
-  });
+  const sigOk = await verifyQStashSignatureWithBody(req, rawText);
   if (!sigOk) {
     log.warn("ingest worker: invalid qstash signature");
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });

@@ -9,7 +9,7 @@
 import { createHash, createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { getEnv } from "./env";
-import { verifyQStashSignature, verifyQStashSignatureRaw } from "./qstash";
+import { verifyQStashSignature, verifyQStashSignatureRaw, verifyQStashSignatureWithBody } from "./qstash";
 
 const URL = "http://localhost:3000/api/workers/ingest";
 const BODY = JSON.stringify({ kind: "ingest", message: { mid: "m_123" } });
@@ -114,5 +114,63 @@ describe("verifyQStashSignature(req)", () => {
   it("returns false when the signature header is absent", async () => {
     const req = new Request(URL, { method: "POST", body: BODY });
     await expect(verifyQStashSignature(req)).resolves.toBe(false);
+  });
+});
+
+describe("verifyQStashSignatureWithBody(req, rawText)", () => {
+  // Regression: all 5 worker routes used to verify against req.url directly.
+  // Behind Vercel/proxies req.url can differ from the URL QStash signed,
+  // which 401s the job — QStash never retries 4xx, so the job is lost with
+  // only a warn log and no error (the silent-drop signature). The helper
+  // rebuilds the signed URL from APP_BASE_URL, so a proxy/internal req.url
+  // must still verify. On the old code path (raw verify with req.url) the
+  // first test below returns false.
+  it("accepts a valid signature when req.url is a proxy/internal URL", async () => {
+    const { current } = keys();
+    // Signed for the public APP_BASE_URL url (http://localhost:3000 in tests).
+    const sig = signJwt({ key: current, body: BODY, url: URL });
+    const req = new Request("http://10.0.0.5:3000/api/workers/ingest", {
+      method: "POST",
+      headers: { "upstash-signature": sig, "content-type": "application/json" },
+      body: BODY,
+    });
+    await expect(verifyQStashSignatureWithBody(req, BODY)).resolves.toBe(true);
+  });
+
+  it("accepts a valid signature for the exact public URL", async () => {
+    const { current } = keys();
+    const sig = signJwt({ key: current, body: BODY, url: URL });
+    const req = new Request(URL, {
+      method: "POST",
+      headers: { "upstash-signature": sig, "content-type": "application/json" },
+      body: BODY,
+    });
+    await expect(verifyQStashSignatureWithBody(req, BODY)).resolves.toBe(true);
+  });
+
+  it("rejects a tampered body", async () => {
+    const { current } = keys();
+    const sig = signJwt({ key: current, body: BODY, url: URL });
+    const req = new Request(URL, {
+      method: "POST",
+      headers: { "upstash-signature": sig, "content-type": "application/json" },
+      body: BODY,
+    });
+    await expect(verifyQStashSignatureWithBody(req, BODY + "x")).resolves.toBe(false);
+  });
+
+  it("rejects a signature made with an unknown key", async () => {
+    const sig = signJwt({ key: "not_a_real_key", body: BODY, url: URL });
+    const req = new Request(URL, {
+      method: "POST",
+      headers: { "upstash-signature": sig, "content-type": "application/json" },
+      body: BODY,
+    });
+    await expect(verifyQStashSignatureWithBody(req, BODY)).resolves.toBe(false);
+  });
+
+  it("rejects a missing signature", async () => {
+    const req = new Request(URL, { method: "POST", body: BODY });
+    await expect(verifyQStashSignatureWithBody(req, BODY)).resolves.toBe(false);
   });
 });

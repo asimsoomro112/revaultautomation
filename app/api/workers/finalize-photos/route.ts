@@ -9,7 +9,7 @@
  * 401 on bad signature, 400 on bad payload, 500 on internal failure.
  */
 import { NextResponse } from "next/server";
-import { verifyQStashSignatureRaw } from "@/lib/qstash";
+import { verifyQStashSignatureWithBody } from "@/lib/qstash";
 import { WorkerPayloadSchema } from "@/lib/ingest";
 import { handleFinalizePhotos } from "@/lib/finalize";
 import { buildFinalizeDeps } from "@/lib/server-deps";
@@ -21,11 +21,7 @@ export const runtime = "nodejs";
 export async function POST(req: Request): Promise<Response> {
   // Read the raw body ONCE — it feeds both signature verification and parsing.
   const rawText = await req.text();
-  const sigOk = await verifyQStashSignatureRaw({
-    signature: req.headers.get("upstash-signature"),
-    body: rawText,
-    url: req.url,
-  });
+  const sigOk = await verifyQStashSignatureWithBody(req, rawText);
   if (!sigOk) {
     log.warn("finalize-photos worker: invalid qstash signature");
     return NextResponse.json({ ok: false, error: "unauthorized" }, { status: 401 });

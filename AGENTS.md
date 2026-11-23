@@ -162,6 +162,17 @@ Workflow: `.agents/workflows/verify.md` (lint → typecheck → test).
   `error` + `attempt` (finalize_retry events carry those, not `detail`) —
   the retry's exact error is now readable in the Detail column.
 
+## Worker signature verification (2026-11-24 — overnight audit)
+- All 5 worker routes verified QStash signatures against `req.url` directly
+  (`verifyQStashSignatureRaw`). The safe helper `verifyQStashSignature`
+  (rebuilds the signed URL from APP_BASE_URL — req.url can differ behind
+  Vercel/proxies) existed, was tested, but was unused by any route. A
+  mismatch 401s the job; QStash never retries 4xx, so the job is lost
+  silently with only a warn log and no error — the silent-drop signature.
+- FIX: new helper `verifyQStashSignatureWithBody(req, rawText)` (same
+  rebuild, for routes that already read the body); all 5 worker routes use
+  it. Tests: the proxy-URL case fails on the old code path.
+
 ## Claude audit fixes (2026-11-23)
 - **Test clock:** `sendSafe` (and any 24h-window check) must use the injected
   clock — `isWithinWindow(x, Date.parse(deps.now()))` — never `Date.now()`.
