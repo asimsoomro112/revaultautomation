@@ -67,6 +67,25 @@ describe("handleMessage: IDLE routing", () => {
     expect(deps.meta.sent).toHaveLength(1);
   });
 
+  it("a transient failure does not anchor the mid — the retry reprocesses it", async () => {
+    deps.gemini.classifyIntentImpl = async () => {
+      throw new Error("Gemini 503 overloaded");
+    };
+    await expect(
+      handleMessage(payload("mid_1"), makeInbound("text", "mid_1", { text: "mujhe shirt bechni hai" }), deps),
+    ).rejects.toThrow("Gemini 503");
+    // The failed mid must NOT be anchored, or the QStash retry would hit
+    // the dup guard and drop the message forever.
+    expect(deps.fdb.convos.get(IGSID)!.last_processed_mid).not.toBe("mid_1");
+
+    deps.gemini.classifyIntentImpl = async () => ({ intent: "SELLER_SUBMIT", confidence: 0.9, lang: "roman" });
+    await handleMessage(payload("mid_1"), makeInbound("text", "mid_1", { text: "mujhe shirt bechni hai" }), deps);
+    const convo = deps.fdb.convos.get(IGSID)!;
+    expect(convo.state).toBe("COLLECTING");
+    expect(convo.last_processed_mid).toBe("mid_1");
+    expect(deps.meta.sent).toHaveLength(1);
+  });
+
   it("listing limit → polite limit reply, no listing", async () => {
     deps.maxListingsPerSellerPerDay = 1;
     deps.gemini.classifyIntentImpl = async () => ({ intent: "SELLER_SUBMIT", confidence: 0.9, lang: "roman" });

@@ -713,40 +713,59 @@ export async function handleMessage(
     return { ok: true };
   }
 
-  // --- inbound anchors (saved immediately so retries stay idempotent) ---
+  // --- inbound anchors (saved immediately so a concurrent duplicate delivery
+  // is deduped) ---
   convo.last_user_msg_at = nowIso;
   convo.window_open = true;
   convo.user_msg_total += 1;
+  const prevMid = convo.last_processed_mid;
   convo.last_processed_mid = mid;
   const text = inbound.text?.trim() ?? "";
   if (convo.user_msg_total <= 2 && text) convo.lang = detectLang([text]);
   await persistConvo(deps, convo);
 
-  // --- human handoff keyword: flag + holding reply ONCE per flag ---
-  if (text && isHumanKeyword(text)) {
-    if (!convo.human_needed) {
-      convo.human_needed = true;
-      await persistConvo(deps, convo);
-      await deps.notifyAdmin(`🙋 Human requested by ${igsid}: "${redactPII(text).slice(0, 140)}"`, { igsid });
-      await sendSafe(deps, convo, { text: humanHandoffReply(convo.lang) });
+  try {
+    // --- human handoff keyword: flag + holding reply ONCE per flag ---
+    if (text && isHumanKeyword(text)) {
+      if (!convo.human_needed) {
+        convo.human_needed = true;
+        await persistConvo(deps, convo);
+        await deps.notifyAdmin(`🙋 Human requested by ${igsid}: "${redactPII(text).slice(0, 140)}"`, { igsid });
+        await sendSafe(deps, convo, { text: humanHandoffReply(convo.lang) });
+      }
+      return { ok: true };
     }
-    return { ok: true };
-  }
-  if (convo.human_needed) {
-    log.info("message.skipped_human_needed", { igsid });
-    return { ok: true };
-  }
+    if (convo.human_needed) {
+      log.info("message.skipped_human_needed", { igsid });
+      return { ok: true };
+    }
 
-  // --- route by inbound kind ---
-  if (inbound.kind === "quick_reply" && inbound.quick_reply_payload) {
-    await handleQuickReply(deps, convo, inbound.quick_reply_payload, mid, nowIso);
-  } else if (inbound.kind === "text" && text) {
-    await handleText(deps, convo, text, nowIso);
-  } else if (inbound.kind === "unsupported") {
-    await persistConvo(deps, convo);
-    await sendSafe(deps, convo, { text: unsupportedReply(inbound.unsupported_hint ?? "", convo.lang) });
-  } else {
-    log.info("message.unhandled_kind", { kind: inbound.kind, mid });
+    // --- route by inbound kind ---
+    if (inbound.kind === "quick_reply" && inbound.quick_reply_payload) {
+      await handleQuickReply(deps, convo, inbound.quick_reply_payload, mid, nowIso);
+    } else if (inbound.kind === "text" && text) {
+      await handleText(deps, convo, text, nowIso);
+    } else if (inbound.kind === "unsupported") {
+      await persistConvo(deps, convo);
+      await sendSafe(deps, convo, { text: unsupportedReply(inbound.unsupported_hint ?? "", convo.lang) });
+    } else {
+      log.info("message.unhandled_kind", { kind: inbound.kind, mid });
+    }
+  } catch (err) {
+    // Transient failure (Gemini / Firestore / Meta): clear the mid anchor so
+    // the QStash retry reprocesses this message. Without this, the retry
+    // would hit the dup guard above and drop the message forever — the
+    // worker 500s, QStash retries, and the anchor says "already done".
+    convo.last_processed_mid = prevMid;
+    try {
+      await persistConvo(deps, convo);
+    } catch (persistErr) {
+      log.warn("message.anchor_clear_failed", {
+        mid,
+        err: String(persistErr).slice(0, 160),
+      });
+    }
+    throw err;
   }
   return { ok: true };
 }
