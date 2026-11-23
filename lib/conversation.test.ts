@@ -96,6 +96,18 @@ describe("isHumanKeyword", () => {
     expect(isHumanKeyword("koi banda hai?")).toBe(true);
     expect(isHumanKeyword("asli banda chahiye")).toBe(true);
   });
+  it("matches handoff phrasing Fix #5 over-corrected into false negatives", () => {
+    // No question mark — "koi banda hai" still asks for a person.
+    expect(isHumanKeyword("koi banda hai")).toBe(true);
+    expect(isHumanKeyword("koi insan hai")).toBe(true);
+    // "chahiye" (need/want) without "baat".
+    expect(isHumanKeyword("mujhe insan chahiye")).toBe(true);
+    expect(isHumanKeyword("insan chahiye")).toBe(true);
+    // Urdu script — the same requests in اردو رسم الخط.
+    expect(isHumanKeyword("انسان سے بات کرنی ہے")).toBe(true);
+    expect(isHumanKeyword("کوئی انسان ہے")).toBe(true);
+    expect(isHumanKeyword("مجھے انسان چاہیے")).toBe(true);
+  });
 });
 
 describe("parseQuickReplyPayload", () => {

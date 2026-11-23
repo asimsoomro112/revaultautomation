@@ -115,11 +115,13 @@ export function detectLang(texts: string[]): Lang {
 // ---------------------------------------------------------------------------
 
 // Handoff intent needs a person-to-talk-to phrasing, not just the word:
-// bare "insan|banda|admi" matched ordinary answers ("admi ke liye hai" is
-// the gender answer; "bandage" and "insaniyat" contain the substring) and
-// permanently muted the seller (human_needed is never cleared).
+// The hai/hain/ho branch must NOT require a literal "?" — "koi banda hai"
+// (no question mark) still asks for a person. The "chahiye" branch covers
+// "mujhe insan chahiye". Urdu-script alternatives cover the same requests
+// in اردو رسم الخط. (Fix #5 over-corrected into these false negatives;
+// re-audit Lane C, 2026-11-24.)
 const HUMAN_RE =
-  /\bhuman\b|real\s*person|asli\s+(banda|insan)|operator\s*(se)?\s*baat|(insan|banda|admi)\s*(se\s*)?baat|(koi\s+)?(insan|banda|admi)\s+(hai|hain|ho)\s*\?/i;
+  /\bhuman\b|real\s*person|asli\s+(banda|insan)|operator\s*(se)?\s*baat|(insan|banda|admi)\s*(se\s*)?baat|(koi\s+)?(insan|banda|admi)\s+(hai|hain|ho)\s*\??|(insan|banda|admi)\s+chahiye|انسان\s*(سے\s*)?بات|کوئی\s*(انسان|بندہ)\s*(ہے|ہیں|ہو)|(انسان|بندہ)\s*چاہیے/i;
 
 /** True if the text asks for a human (English + Roman-Urdu variants). */
 export function isHumanKeyword(text: string): boolean {
