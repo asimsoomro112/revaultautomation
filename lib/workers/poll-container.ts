@@ -16,13 +16,19 @@
  *      the container is NEVER recreated for it.
  *  - IN_PROGRESS (or transient status-call failure) → re-enqueue with
  *      backoff min(30*2^attempt, 300); attempt > 8 → FAILED.
- *  - Idempotent: PUBLISHED / media_id already set → no-op (two poll workers
- *    can never publish the same listing twice).
+ *  - Idempotent: PUBLISHED → no-op; REJECTED/FAILED → terminal no-op (an
+ *    in-flight poll must never resurrect a rejected/failed listing).
+ *    media_id already set → finalize once: the re-read inside
+ *    finalizePublished no-ops if another delivery already finalized, and a
+ *    poll arriving while the winner still holds the lease requeues instead
+ *    of double-counting / double-DMing. Two poll workers can never publish
+ *    the same listing twice.
  */
 import { tzDay } from "@/lib/schedule";
 import { log } from "@/lib/log";
 import {
   failListing,
+  isTerminalStatus,
   liveSettings,
   parkForKillSwitch,
   KillSwitchEngaged,
@@ -41,6 +47,7 @@ export interface PollOutcome {
   outcome:
     | "missing"
     | "already-published"
+    | "terminal"
     | "recovered"
     | "killed"
     | "not-claimed"
@@ -54,6 +61,20 @@ export interface PollOutcome {
     | "unknown-container";
   permalink?: string;
   error?: string;
+}
+
+/**
+ * True when another worker currently holds the publish lease (locked_until
+ * in the future per the injected clock). While the lease is held, the
+ * holder is alive mid-publish — a duplicate poll must requeue and wait,
+ * not finalize: finalizing now would double-count the daily counter and
+ * double-DM the seller while the winner is still fetching the permalink.
+ * A free/expired lease means the holder crashed, so finalize (recovery).
+ */
+function isLeaseHeld(publish: ListingDoc["publish"], now: Date): boolean {
+  if (!publish.locked_until) return false;
+  const until = Date.parse(publish.locked_until);
+  return !Number.isNaN(until) && until > now.getTime();
 }
 
 export const SELLER_PUBLISHED_DM = (permalink: string): string =>
@@ -75,8 +96,21 @@ export async function handlePollContainer(
     log.info("poll worker: already PUBLISHED, no-op", { listing_id: listingId });
     return { outcome: "already-published" };
   }
+  if (isTerminalStatus(listing.status)) {
+    // REJECTED/FAILED listings must never resurrect: their in-flight polls
+    // used to requeue until failListing flipped them to FAILED (wrong DM,
+    // and FAILED re-opens Retry → a rejected listing could go live).
+    log.info("poll worker: terminal status, no-op", { listing_id: listingId, status: listing.status });
+    return { outcome: "terminal" };
+  }
   if (listing.publish.media_id) {
-    // Another worker published while this poll was in flight — finalize.
+    // Another worker published while this poll was in flight — finalize,
+    // unless the winner is still alive mid-publish (lease held): then
+    // requeue and let the winner finish; finalizing now would double-count
+    // the daily counter and double-DM the seller.
+    if (isLeaseHeld(listing.publish, deps.now())) {
+      return requeueBackoff(deps, listing, payload, "media_id set, winner still holds the lease");
+    }
     return finalizePublished(deps, listing, listing.publish.media_id);
   }
 
@@ -359,6 +393,13 @@ async function publishNow(
   if (!claim.claimed) {
     const fresh = await deps.getListing(listingId);
     if (fresh?.publish.media_id) {
+      // The winner may have published since this delivery read the listing
+      // — but only finalize if it is done (lease free): while the winner
+      // holds the lease it is still fetching the permalink, and finalizing
+      // now would double-count and double-DM.
+      if (isLeaseHeld(fresh.publish, deps.now())) {
+        return requeueBackoff(deps, listing, payload, "publish claim held by another worker");
+      }
       return finalizePublished(deps, fresh, fresh.publish.media_id);
     }
     return requeueBackoff(deps, listing, payload, "publish claim held by another worker");
@@ -392,6 +433,15 @@ async function finalizePublished(
   permalink?: string,
 ): Promise<PollOutcome> {
   const listingId = listing.id;
+  // Re-read FIRST and no-op if another delivery already finalized: the
+  // counter bump + seller DM below must run exactly once per listing. A
+  // duplicate poll arriving in the media_id window used to run them again.
+  const fresh = (await deps.getListing(listingId)) ?? listing;
+  if (fresh.status === "PUBLISHED") {
+    log.info("poll worker: already finalized by another delivery, no-op", { listing_id: listingId });
+    const doneLink = fresh.publish.permalink ?? permalink;
+    return doneLink ? { outcome: "already-published", permalink: doneLink } : { outcome: "already-published" };
+  }
   let link = permalink;
   if (!link) {
     link = await deps.getMeta().getPermalink(mediaId);
@@ -399,7 +449,6 @@ async function finalizePublished(
   const now = deps.now();
   const settings = await deps.getSettings();
   await deps.recordPublish(tzDay(now, settings.posting_window.tz), now);
-  const fresh = (await deps.getListing(listingId)) ?? listing;
   await deps.saveListing(listingId, {
     status: "PUBLISHED",
     publish: { ...fresh.publish, media_id: mediaId, permalink: link, last_error: null, locked_until: null },

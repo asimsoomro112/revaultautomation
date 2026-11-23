@@ -150,7 +150,23 @@ export async function liveSettings(deps: WorkerDeps): Promise<AdminSettings> {
  * activity, wrongly killing a healthy listing. The admin resumes it from
  * /admin (approve accepts QUEUED and re-enqueues the publish worker).
  */
+/** Terminal statuses: a listing here must never move again (no park, no fail, no publish). */
+const TERMINAL_STATUSES = new Set(["REJECTED", "PUBLISHED", "FAILED"]);
+
+/** True when the listing is in a terminal status — in-flight work must leave it alone. */
+export function isTerminalStatus(status: string): boolean {
+  return TERMINAL_STATUSES.has(status);
+}
+
 export async function parkForKillSwitch(deps: WorkerDeps, listing: ListingDoc): Promise<void> {
+  // A REJECTED listing must never be parked back to QUEUED: its in-flight
+  // polls would then re-run, fail, and flip it to FAILED — and an admin
+  // Retry on FAILED would publish a listing the admin explicitly rejected
+  // (2026-11-24 re-audit Lane B N1). Terminal listings stay terminal.
+  if (isTerminalStatus(listing.status)) {
+    log.info("publish park skipped — listing is terminal", { listing_id: listing.id, status: listing.status });
+    return;
+  }
   await deps.saveListing(listing.id, {
     status: "QUEUED",
     publish: { ...listing.publish, locked_until: null, last_error: "killed" },
@@ -169,6 +185,15 @@ export const SELLER_FAILURE_DM =
 
 /** Mark FAILED: attempts++, last_error, event, Telegram alert, neutral seller DM. */
 export async function failListing(deps: WorkerDeps, listing: ListingDoc, reason: string): Promise<void> {
+  // Never transition OUT of a terminal status: a REJECTED listing must not
+  // become FAILED (its seller already got the rejection DM; a second
+  // "technical issue" DM contradicts it, and FAILED re-opens the Retry path
+  // to publishing a rejected listing), and an already-FAILED listing must
+  // not be re-failed (attempts/last_error overwritten, duplicate DM+alert).
+  if (isTerminalStatus(listing.status)) {
+    log.info("failListing skipped — listing is terminal", { listing_id: listing.id, status: listing.status });
+    return;
+  }
   const msg = reason.slice(0, 300);
   await deps.saveListing(listing.id, {
     status: "FAILED",

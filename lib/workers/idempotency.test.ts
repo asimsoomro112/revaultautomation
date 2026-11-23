@@ -12,6 +12,7 @@ vi.mock("@/lib/slides", () => ({
 import { blankListingDoc } from "@/lib/db";
 import { handlePublish } from "./publish";
 import { handlePollContainer } from "./poll-container";
+import { failListing, parkForKillSwitch } from "./common";
 import type { WorkerDeps } from "./common";
 import type {
   AdminSettings,
@@ -573,5 +574,137 @@ describe("poll-container recovery", () => {
     expect(r.outcome).toBe("published");
     expect(state.meta.calls.mediaPublish).toBe(1);
     expect(state.meta.calls.createCarousel).toBe(0);
+  });
+});
+
+describe("terminal-status guards — rejected/failed listings never resurrect (re-audit Lane B N1, Lane A N2/N3)", () => {
+  function pollPayload(containerId: string, attempt = 0): PollContainerPayload {
+    return { kind: "poll-container", listing_id: "lst1", container_id: containerId, role: "child", attempt };
+  }
+
+  it("poll on a REJECTED listing is a terminal no-op (no resurrect, no DM, no requeue)", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    const listing = state.listings.get("lst1")!;
+    listing.status = "REJECTED";
+    listing.publish.container_ids = ["child_0"];
+    listing.publish.container_status = { child_0: "FINISHED" };
+    const before = state.polls.length;
+    const r = await handlePollContainer(pollPayload("child_0"), deps);
+    expect(r.outcome).toBe("terminal");
+    expect(state.listings.get("lst1")!.status).toBe("REJECTED");
+    expect(state.meta.calls.mediaPublish).toBe(0);
+    expect(state.dms).toHaveLength(0);
+    expect(state.notifications).toHaveLength(0);
+    expect(state.polls.length).toBe(before); // not requeued
+  });
+
+  it("poll on a FAILED listing is a terminal no-op (no container recreation, no second failure DM)", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    const listing = state.listings.get("lst1")!;
+    listing.status = "FAILED";
+    listing.publish.container_ids = ["child_0"];
+    listing.publish.container_status = { child_0: "ERROR" };
+    listing.publish.attempts = 3;
+    state.meta.statusFor = () => "ERROR";
+    const r = await handlePollContainer(pollPayload("child_0"), deps);
+    expect(r.outcome).toBe("terminal");
+    expect(state.listings.get("lst1")!.status).toBe("FAILED");
+    expect(state.listings.get("lst1")!.publish.attempts).toBe(3);
+    expect(state.meta.calls.createImage).toBe(0);
+    expect(state.dms).toHaveLength(0);
+    expect(state.notifications).toHaveLength(0);
+  });
+
+  it("kill-switch park never resurrects a REJECTED listing to QUEUED", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    const listing = state.listings.get("lst1")!;
+    listing.status = "REJECTED";
+    await parkForKillSwitch(deps, listing);
+    expect(state.listings.get("lst1")!.status).toBe("REJECTED");
+    expect(state.notifications).toHaveLength(0);
+  });
+
+  it("failListing never transitions out of a terminal status (REJECTED stays, FAILED is not re-failed)", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    const listing = state.listings.get("lst1")!;
+    listing.status = "REJECTED";
+    await failListing(deps, listing, "stale poll timed out");
+    expect(state.listings.get("lst1")!.status).toBe("REJECTED");
+    expect(state.dms).toHaveLength(0);
+    expect(state.notifications).toHaveLength(0);
+
+    const failed = state.listings.get("lst1")!;
+    failed.status = "FAILED";
+    failed.publish.attempts = 2;
+    await failListing(deps, failed, "second failure");
+    expect(state.listings.get("lst1")!.status).toBe("FAILED");
+    expect(state.listings.get("lst1")!.publish.attempts).toBe(2);
+    expect(state.dms).toHaveLength(0);
+    expect(state.notifications).toHaveLength(0);
+  });
+
+  it("finalizePublished no-ops when the listing turned PUBLISHED mid-flight (no double count / DM)", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    const listing = state.listings.get("lst1")!;
+    listing.status = "PUBLISHING";
+    listing.publish.media_id = "media_1";
+    listing.publish.permalink = null;
+    listing.publish.locked_until = null;
+    listing.publish.container_ids = ["child_0"];
+    listing.publish.container_status = { child_0: "FINISHED" };
+    // The winner's PUBLISHED write lands between this poll's entry read
+    // and finalizePublished's re-read: the 2nd getListing call sees it.
+    let calls = 0;
+    const origGet = deps.getListing;
+    deps.getListing = async (id) => {
+      const doc = await origGet(id);
+      calls++;
+      if (calls === 2 && doc) return { ...doc, status: "PUBLISHED" as const };
+      return doc;
+    };
+    const r = await handlePollContainer(pollPayload("child_0"), deps);
+    expect(r.outcome).toBe("already-published");
+    expect(state.postsToday).toBe(0); // counter not bumped twice
+    expect(state.dms).toHaveLength(0); // seller not DM'd twice
+  });
+
+  it("duplicate poll while the winner holds the lease requeues instead of double-finalizing", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    const listing = state.listings.get("lst1")!;
+    listing.status = "PUBLISHING";
+    listing.publish.media_id = "media_1";
+    listing.publish.permalink = null;
+    // Lease held: winner is alive mid-permalink-fetch (fake clock is
+    // 2026-09-30T10:00Z, so 11:00Z is in the future for deps.now()).
+    listing.publish.locked_until = "2026-09-30T11:00:00Z";
+    listing.publish.container_ids = ["child_0"];
+    listing.publish.container_status = { child_0: "FINISHED" };
+    const r = await handlePollContainer(pollPayload("child_0"), deps);
+    expect(r.outcome).toBe("requeued");
+    expect(state.postsToday).toBe(0);
+    expect(state.dms).toHaveLength(0);
+    expect(state.meta.calls.mediaPublish).toBe(0);
+  });
+
+  it("poll finalizes when the lease expired after a crash (recovery still works)", async () => {
+    const state = makeState();
+    const deps = makeDeps(state);
+    const listing = state.listings.get("lst1")!;
+    listing.status = "PUBLISHING";
+    listing.publish.media_id = "media_1";
+    listing.publish.permalink = null;
+    listing.publish.locked_until = "2026-09-30T09:00:00Z"; // expired vs fake now
+    listing.publish.container_ids = ["child_0"];
+    listing.publish.container_status = { child_0: "FINISHED" };
+    const r = await handlePollContainer(pollPayload("child_0"), deps);
+    expect(r.outcome).toBe("published");
+    expect(state.postsToday).toBe(1);
+    expect(state.dms).toHaveLength(1);
   });
 });
