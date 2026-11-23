@@ -567,6 +567,43 @@ describe("handleMessage: consent", () => {
   });
 });
 
+describe("handleMessage: stale quick reply on CONFIRM with an unprocessed photo", () => {
+  it("defer flips the LISTING to NEEDS_INFO too, so the re-armed finalize can run (no deadlock)", async () => {
+    const convo = await deps.db.getOrCreateConversation(IGSID);
+    const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
+    listing.status = "CONFIRM";
+    listing.extracted = fullTestExtracted();
+    // One photo whose dhash failed (phash "") — finalize's moveToConfirm
+    // does not gate on phash, so this listing reached CONFIRM unexamined.
+    listing.photos = [
+      makePhoto("sellers/x/0.jpg"),
+      { storage_path: "sellers/x/1.jpg", w: 800, h: 1000, phash: "", received_at: NOW },
+    ];
+    listing.missing = [];
+    await deps.db.createListing(listing);
+    convo.state = "CONFIRM";
+    convo.active_listing_id = "lst_1";
+    convo.last_user_msg_at = NOW;
+
+    // A stale quick-reply tap (the seller's old "condition" buttons).
+    await handleMessage(
+      payload("mid_q"),
+      makeInbound("quick_reply", "mid_q", { quick_reply_payload: "info:condition:like_new", text: "Like new" }),
+      deps,
+    );
+
+    // Old code: the defer set only the convo to NEEDS_INFO; the listing
+    // stayed CONFIRM, the re-armed finalize skipped on status (not
+    // PROCESSABLE), and the hold never resolved — no DM, no alert.
+    const updated = deps.fdb.listings.get("lst_1")!;
+    expect(updated.status).toBe("NEEDS_INFO");
+    expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
+    expect(deps.enqueued.filter((e) => e.route === "finalize-photos").length).toBeGreaterThan(0);
+    const sent = deps.meta.sent[deps.meta.sent.length - 1]!;
+    expect(sent.opts.text).toMatch(/wait karein|wait a moment|انتظار/);
+  });
+});
+
 describe("scripted multi-turn flow", () => {
   it("IDLE→COLLECTING→NEEDS_INFO→CONFIRM→SUBMITTED", async () => {
     deps.gemini.classifyIntentImpl = async () => ({ intent: "SELLER_SUBMIT", confidence: 0.9, lang: "roman" });

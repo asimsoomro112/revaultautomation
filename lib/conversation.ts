@@ -578,7 +578,15 @@ function hasUnprocessedPhoto(listing: ListingDoc): boolean {
  * fresh activity (the answer's bump invalidated the photo's own armed
  * finalize), stay in NEEDS_INFO, and tell the seller to wait. The re-armed
  * finalize moves the listing to CONFIRM (or REVIEW) once checked — no
- * deadlock, since finalize's own moveToConfirm does not check phash. */
+ * deadlock, since finalize's own moveToConfirm does not check phash.
+ *
+ * The LISTING status must move to NEEDS_INFO too, not just the convo: a
+ * stale quick-reply tap can reach this defer while the listing is CONFIRM
+ * (a dhash-failed photo leaves phash "" and finalize does not gate on it),
+ * and CONFIRM is not in finalize's PROCESSABLE set — the re-armed finalize
+ * would skip on status and the hold would never resolve, with no DM and no
+ * alert (2026-11-24 re-audit Lane C NEW-1). On the normal path the listing
+ * is already NEEDS_INFO, so the patch is a no-op. */
 async function deferConfirmForPhotoCheck(
   deps: Deps,
   convo: ConversationDoc,
@@ -586,6 +594,12 @@ async function deferConfirmForPhotoCheck(
   nowIso: string,
 ): Promise<void> {
   await rearmFinalizeForText(deps, listing, nowIso);
+  if (listing.status !== "NEEDS_INFO") {
+    await deps.db.mutateListing(listing.id, () => ({
+      patch: { status: "NEEDS_INFO" },
+      result: undefined,
+    }));
+  }
   setConversationState(convo, "NEEDS_INFO");
   await persistConvo(deps, convo);
   await sendSafe(deps, convo, { text: photoCheckHoldReply(convo.lang) });
