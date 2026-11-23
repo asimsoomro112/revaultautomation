@@ -144,7 +144,7 @@
   transition: color var(--rv-dur) var(--rv-ease);
 }
 
-.bottomNavIcon {
+.bottomNavLink svg {
   width: 22px;
   height: 22px;
   flex: 0 0 auto;
@@ -188,12 +188,6 @@
   font-size: 15px;
   font-weight: 600;
   color: var(--rv-text);
-}
-
-.grid2 {
-  display: grid;
-  grid-template-columns: 1fr;
-  gap: 20px;
 }
 
 .card {
@@ -849,13 +843,6 @@
   }
 }
 
-@media (min-width: 900px) {
-  .grid2 {
-    grid-template-columns: 1fr 1fr;
-    gap: 24px;
-  }
-}
-
 @media (min-width: 1024px) {
   .photos img {
     width: 160px;
@@ -986,5 +973,143 @@
 
   .formActions .btn {
     flex: 0 0 auto;
+  }
+}
+
+/* --- Admin pages (2026-11-23): one route per section --- */
+
+/* Page head: title + one-line description above each section. */
+.pageHead {
+  margin: 4px 0 0;
+}
+
+.pageTitle {
+  margin: 0;
+  font-size: 22px;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--rv-text);
+}
+
+.pageDesc {
+  margin: 6px 0 0;
+  font-size: 14px;
+  color: var(--rv-muted);
+  line-height: 1.5;
+}
+
+/* Dashboard home: one card per section page. */
+.cardGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.navCard {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+  background: var(--rv-surface);
+  border: 1px solid var(--rv-border);
+  border-radius: var(--rv-radius-lg);
+  padding: 16px;
+  color: var(--rv-text);
+  text-decoration: none;
+  min-height: 44px;
+  transition: border-color var(--rv-dur) var(--rv-ease);
+}
+
+.navCard:hover {
+  border-color: var(--rv-border-strong);
+}
+
+.navCard svg {
+  color: var(--rv-accent);
+}
+
+.navCardLabel {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.navCardBlurb {
+  font-size: 13px;
+  color: var(--rv-muted);
+  line-height: 1.5;
+}
+
+/* Active nav link: accent colour AND a pill background, so the current
+   page is clear without relying on colour alone. */
+.bottomNavLinkActive {
+  color: var(--rv-accent);
+  background: rgb(34 197 94 / 0.12);
+  border-radius: 999px;
+}
+
+/* Desktop top navigation: same nine pages as the bottom bar. Hidden on
+   mobile, where the bottom pill is the nav. */
+.topNav {
+  display: none;
+}
+
+.topNavLink {
+  flex: 0 0 auto;
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--rv-muted);
+  text-decoration: none;
+  white-space: nowrap;
+  border-radius: 999px;
+  transition: color var(--rv-dur) var(--rv-ease);
+}
+
+.topNavLink svg {
+  width: 18px;
+  height: 18px;
+  flex: 0 0 auto;
+}
+
+.topNavLink:hover {
+  color: var(--rv-text);
+}
+
+.topNavLinkActive {
+  color: var(--rv-accent);
+  background: rgb(34 197 94 / 0.12);
+}
+
+@media (min-width: 640px) {
+  .cardGrid {
+    grid-template-columns: repeat(4, 1fr);
+  }
+}
+
+@media (min-width: 1024px) {
+  .topNav {
+    display: flex;
+    overflow-x: auto;
+    scrollbar-width: none;
+    width: calc(100% - 24px);
+    max-width: var(--rv-container);
+    margin: 12px auto 0;
+    padding: 4px 8px;
+    background: rgb(20 26 36 / 0.94);
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    border: 1px solid rgb(255 255 255 / 0.14);
+    border-radius: 999px;
+    box-shadow:
+      0 8px 32px rgb(0 0 0 / 0.45),
+      inset 0 1px 0 rgb(255 255 255 / 0.16);
+  }
+
+  .topNav::-webkit-scrollbar {
+    display: none;
   }
 }

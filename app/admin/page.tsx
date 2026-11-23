@@ -1,129 +1,34 @@
-"use client";
-
-/**
- * /admin — ReVault operations dashboard.
- *
- * Firebase Google sign-in (client SDK) → onAuthStateChanged → every
- * /api/admin call carries `Authorization: Bearer <ID token>`. Signed-out
- * users see the sign-in screen; non-admin tokens get an "Access denied"
- * screen (the API returns 401/403).
- */
-import { useEffect, useState } from "react";
-import { onAuthStateChanged, signOut, type User } from "firebase/auth";
-import { getClientAuth, getClientConfigError } from "./firebase-client";
-import SignInScreen from "./components/SignInScreen";
+import Link from "next/link";
 import StatsRow from "./components/StatsRow";
-import QueueSection from "./components/QueueSection";
-import PublishLog from "./components/PublishLog";
-import QuotaGauge from "./components/QuotaGauge";
-import KillSwitch from "./components/KillSwitch";
-import TokenHealth from "./components/TokenHealth";
-import SettingsSection from "./components/SettingsSection";
-import ActivityFeed from "./components/ActivityFeed";
-import BannedSellers from "./components/BannedSellers";
-import BottomNav from "./components/BottomNav";
-import LogoMark from "../components/LogoMark";
-import { adminFetch } from "./components/api";
+import { ICONS } from "./components/navIcons";
+import { NAV_LINKS } from "./components/navLinks";
 import styles from "./styles.module.css";
 
-type AuthPhase = "loading" | "signed-out" | "checking" | "denied" | "ready";
-
-export default function AdminPage() {
-  const [configError] = useState<string | null>(() => getClientConfigError());
-  const [phase, setPhase] = useState<AuthPhase>(
-    configError ? "signed-out" : "loading",
-  );
-  const [user, setUser] = useState<User | null>(null);
-  const [deniedMsg, setDeniedMsg] = useState<string>("");
-
-  useEffect(() => {
-    if (configError) return;
-    const unsub = onAuthStateChanged(getClientAuth(), async (u) => {
-      setUser(u);
-      if (!u) {
-        setPhase("signed-out");
-        return;
-      }
-      setPhase("checking");
-      try {
-        // A cheap authed call proves the token carries admin rights.
-        await adminFetch<{ kill_switch: boolean }>("/settings");
-        setPhase("ready");
-      } catch (e) {
-        setDeniedMsg(e instanceof Error ? e.message : String(e));
-        setPhase("denied");
-      }
-    });
-    return unsub;
-  }, [configError]);
-
-  async function handleSignOut() {
-    await signOut(getClientAuth());
-  }
-
-  if (phase === "loading" || phase === "checking") {
-    return (
-      <div className={styles.page}>
-        <div className={styles.signinWrap}>
-          <div className={styles.muted}>Loading…</div>
-        </div>
-      </div>
-    );
-  }
-
-  if (phase === "signed-out") {
-    return <SignInScreen configError={configError} />;
-  }
-
-  if (phase === "denied") {
-    return (
-      <div className={styles.page}>
-        <div className={styles.signinWrap}>
-          <div className={styles.signinCard}>
-            <h1>
-              ReVault <span>Admin</span>
-            </h1>
-            <div className={styles.alert}>
-              Access denied — {user?.email ?? "this account"} is not an admin.
-              <div className={styles.muted} style={{ marginTop: 8 }}>{deniedMsg}</div>
-            </div>
-            <button className={styles.btn} onClick={handleSignOut}>
-              Sign out
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
+/**
+ * /admin — dashboard home. Stats on top, then one card per section page.
+ * The bottom bar (mobile) and the top bar (desktop) navigate the same
+ * nine routes; the cards are the third way in, for the home page itself.
+ */
+export default function AdminHomePage() {
   return (
-    <div className={styles.page}>
-      <header className={styles.header}>
-        <div className={styles.logo}>
-          <LogoMark size={28} className={styles.logoMark} />
-          ReVault <span className={styles.logoAdmin}>Admin</span>
-        </div>
-        <div className={styles.userbox}>
-          <span className={styles.userEmail}>{user?.email}</span>
-          <button className={styles.btn} onClick={handleSignOut}>
-            Sign out
-          </button>
-        </div>
-      </header>
-      <main className={styles.main}>
-        <StatsRow />
-        <QueueSection />
-        <div className={styles.grid2}>
-          <QuotaGauge />
-          <TokenHealth />
-        </div>
-        <KillSwitch />
-        <PublishLog />
-        <SettingsSection />
-        <ActivityFeed />
-        <BannedSellers />
-      </main>
-      <BottomNav />
-    </div>
+    <>
+      <div className={styles.pageHead}>
+        <h1 className={styles.pageTitle}>Dashboard</h1>
+        <p className={styles.pageDesc}>
+          Everything about the bot, at a glance. Open a section below, or use
+          the navigation bar.
+        </p>
+      </div>
+      <StatsRow />
+      <nav className={styles.cardGrid} aria-label="Admin sections">
+        {NAV_LINKS.filter((l) => l.href !== "/admin").map((l) => (
+          <Link key={l.href} href={l.href} className={styles.navCard}>
+            {ICONS[l.icon]}
+            <span className={styles.navCardLabel}>{l.label}</span>
+            <span className={styles.navCardBlurb}>{l.blurb}</span>
+          </Link>
+        ))}
+      </nav>
+    </>
   );
 }
