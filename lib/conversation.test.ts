@@ -289,4 +289,20 @@ describe("parseDetailsDump", () => {
   it("returns [] for free text with no Key: value lines", () => {
     expect(parseDetailsDump("mujhe ye bechni hai")).toEqual([]);
   });
+  it("ignores qualifier-prefixed keys — 'Delivery type' is not a category", () => {
+    // The key regexes must be start-anchored: an unanchored "type" matched
+    // "Delivery type" and corrupted the category with the courier name.
+    expect(parseDetailsDump("Delivery type: TCS\nBrand: Grace\nSize: M")).toEqual([
+      { field: "brand", rawValue: "Grace" },
+      { field: "size", rawValue: "M" },
+    ]);
+    expect(parseDetailsDump("Pickup location: Karachi\nCity: Lahore")).toEqual([
+      { field: "city", rawValue: "Lahore" },
+    ]);
+  });
+  it("still matches a bare measurement key at the start", () => {
+    expect(parseDetailsDump("Shoulder length: 20\nLength: 25")).toEqual([
+      { field: "measurements", rawValue: "20" },
+    ]);
+  });
 });

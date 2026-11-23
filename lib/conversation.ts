@@ -347,20 +347,26 @@ export interface ParsedDetail {
  * arrived after finalize and was lost). Parse every recognizable "Key: value"
  * line into a field; unknown keys (Dc, Shoulder…) are skipped.
  */
+// Every alternative is start-anchored: an unanchored branch (e.g. the bare
+// "type" in /^categor(y|ies)|type|qisam/i) matched ANYWHERE in the key, so
+// "Delivery type: TCS" corrupted the category with the courier name and
+// "Pickup location: Karachi" overwrote the city. An unrecognised key is
+// skipped and the field stays missing (the bot asks again) — a wrong value
+// that could go live is worse than a missing one.
 const DETAIL_KEY_TO_FIELD: Array<[RegExp, string]> = [
   [/^discount(ed)?\s+price/i, "price_pkr"],
   [/^(sale\s+price|price|qeemat|qimat|daam|rate)\b/i, "price_pkr"],
   [/^original\s+price/i, "__original_price"],
-  [/^brand/i, "brand"],
-  [/^size/i, "size"],
-  [/^condition|halat/i, "condition"],
-  [/^city|sheher|shehr|location/i, "city"],
-  [/^measurements?|naap/i, "measurements"],
-  [/^length|width|chest|shoulder|sleeve|waist/i, "measurements"],
-  [/^categor(y|ies)|type|qisam/i, "category"],
-  [/^colou?r|rang/i, "color"],
-  [/^gender/i, "gender"],
-  [/^defects?|damage|kharabi/i, "defects"],
+  [/^brand\b/i, "brand"],
+  [/^size\b/i, "size"],
+  [/^(condition|halat)\b/i, "condition"],
+  [/^(city|sheher|shehr|location)\b/i, "city"],
+  [/^(measurements?|naap)\b/i, "measurements"],
+  [/^(length|width|chest|shoulder|sleeve|waist)\b/i, "measurements"],
+  [/^(categor(y|ies)|type|qisam)\b/i, "category"],
+  [/^(colou?r|rang)\b/i, "color"],
+  [/^gender\b/i, "gender"],
+  [/^(defects?|damage|kharabi)\b/i, "defects"],
 ];
 
 export function parseDetailsDump(text: string): ParsedDetail[] {
