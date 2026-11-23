@@ -34,10 +34,11 @@ const mocks = vi.hoisted(() => {
     settings,
     blocklist: new Map<string, { reason: string; at: string; by: string }>(),
     conversations: new Map<string, Record<string, unknown>>(),
+    listings: [] as Array<{ id: string; created_at: string }>,
     events: [] as Array<{
       id: string;
       listingId: string;
-      data: { type: string; at: string; by?: string | null; detail?: string | null };
+      data: { type: string; at: string; by?: string | null; detail?: string | null; photo_count?: number };
     }>,
     getAdminSettings: vi.fn(async () => settings),
     updateAdminSettings: vi.fn(async (patch: Record<string, unknown>) => {
@@ -83,20 +84,34 @@ vi.mock("@/lib/firebase-admin", () => {
           (d) => (d.data() as { at: string }).at,
         );
       }
-      throw new Error(`fakeDb.collection(${name}) not stubbed`);
-    },
-    collectionGroup: (name: string) => {
-      if (name === "events") {
+      if (name === "listings") {
         return orderLimitGet(
-          mocks.events.map((e) => ({
-            id: e.id,
-            data: () => e.data,
-            ref: { parent: { parent: { id: e.listingId } } },
+          mocks.listings.map((l) => ({
+            id: l.id,
+            data: () => ({ created_at: l.created_at }),
+            ref: {
+              collection: (sub: string) => {
+                if (sub !== "events") throw new Error(`fakeDb listings ref.collection(${sub}) not stubbed`);
+                return orderLimitGet(
+                  mocks.events
+                    .filter((e) => e.listingId === l.id)
+                    .map((e) => ({ id: e.id, data: () => e.data })),
+                  (d) => (d.data() as { at: string }).at,
+                );
+              },
+            },
           })),
-          (d) => (d.data() as { at: string }).at,
+          (d) => (d.data() as { created_at: string }).created_at,
         );
       }
-      throw new Error(`fakeDb.collectionGroup(${name}) not stubbed`);
+      throw new Error(`fakeDb.collection(${name}) not stubbed`);
+    },
+    // The activity endpoint must NOT use collectionGroup: it needs a
+    // composite index on the events collection group, and Firestore 500s
+    // until that index exists (2026-11-23: /admin/activity 500d).
+    // Throw here so any future use fails the test instead of prod.
+    collectionGroup: (_name: string) => {
+      throw new Error("fakeDb.collectionGroup must not be called");
     },
     doc: (path: string) => {
       const parts = path.split("/");
@@ -171,6 +186,7 @@ beforeEach(() => {
   mocks.authOk = true;
   mocks.blocklist.clear();
   mocks.conversations.clear();
+  mocks.listings.length = 0;
   mocks.events.length = 0;
   vi.clearAllMocks();
   // restore the shared settings object to the test-fakes defaults
@@ -233,21 +249,27 @@ describe("POST /api/admin/settings", () => {
 });
 
 describe("GET /api/admin/activity", () => {
-  it("returns events newest-first with the listing id from the parent ref", async () => {
+  it("returns events newest-first with the listing id and photo_count, without collectionGroup", async () => {
+    mocks.listings.push(
+      { id: "lst_old", created_at: "2026-11-20T09:00:00.000Z" },
+      { id: "lst_new", created_at: "2026-11-23T08:00:00.000Z" },
+    );
     mocks.events.push(
       { id: "e1", listingId: "lst_old", data: { type: "approved", at: "2026-11-20T10:00:00.000Z", by: "a@test", detail: "Approved in /admin" } },
-      { id: "e2", listingId: "lst_new", data: { type: "published", at: "2026-11-23T09:00:00.000Z", by: null, detail: null } },
+      { id: "e2", listingId: "lst_new", data: { type: "finalized", at: "2026-11-23T09:00:00.000Z", by: null, detail: null, photo_count: 3 } },
     );
     const res = await GET(getReq("activity"), ctx(["activity"]));
     expect(res.status).toBe(200);
     const data = (await res.json()) as {
-      items: Array<{ id: string; listing_id: string; type: string; at: string }>;
+      items: Array<{ id: string; listing_id: string; type: string; at: string; photo_count: number | null }>;
     };
     expect(data.items).toHaveLength(2);
     expect(data.items[0]?.id).toBe("e2");
     expect(data.items[0]?.listing_id).toBe("lst_new");
-    expect(data.items[0]?.type).toBe("published");
+    expect(data.items[0]?.type).toBe("finalized");
+    expect(data.items[0]?.photo_count).toBe(3);
     expect(data.items[1]?.listing_id).toBe("lst_old");
+    expect(data.items[1]?.photo_count).toBeNull();
   });
 });
 

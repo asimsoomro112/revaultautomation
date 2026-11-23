@@ -291,29 +291,49 @@ async function handleGet(path: string[]) {
   }
 
   // GET /api/admin/activity — latest audit events across all listings.
-  // collectionGroup + single-field orderBy needs no composite index.
+  // NO collectionGroup query: it needs a composite index on the events
+  // collection group, and Firestore answers FAILED_PRECONDITION (→ 500)
+  // until that index exists and builds — 2026-11-23 the /admin/activity
+  // page 500d exactly this way (the old comment claiming otherwise was
+  // wrong; firestore.indexes.json has no events index). Instead, read
+  // the latest events per listing and merge newest-first in memory —
+  // the same pattern the queue endpoint uses. Single-collection orderBy
+  // uses the auto single-field index, so this works with no index deploy.
+  // photo_count is surfaced on finalized events (it decides the
+  // burst-photo question: how many photos the extraction actually saw).
   if (a === "activity" && !b) {
-    const snap = await adminDb()
-      .collectionGroup("events")
-      .orderBy("at", "desc")
-      .limit(25)
+    const listingsSnap = await adminDb()
+      .collection("listings")
+      .orderBy("created_at", "desc")
+      .limit(50)
       .get();
-    const items = snap.docs.map((e) => {
-      const data = e.data() as {
-        type?: string;
-        at?: string;
-        by?: string | null;
-        detail?: string | null;
-      };
-      return {
-        id: e.id,
-        listing_id: e.ref.parent.parent?.id ?? null,
-        type: data.type ?? "unknown",
-        at: data.at ?? null,
-        by: data.by ?? null,
-        detail: data.detail ?? null,
-      };
-    });
+    const perListing = await Promise.all(
+      listingsSnap.docs.map(async (d) => {
+        const ev = await d.ref.collection("events").orderBy("at", "desc").limit(10).get();
+        return ev.docs.map((e) => {
+          const data = e.data() as {
+            type?: string;
+            at?: string;
+            by?: string | null;
+            detail?: string | null;
+            photo_count?: number;
+          };
+          return {
+            id: e.id,
+            listing_id: d.id,
+            type: data.type ?? "unknown",
+            at: data.at ?? null,
+            by: data.by ?? null,
+            detail: data.detail ?? null,
+            photo_count: typeof data.photo_count === "number" ? data.photo_count : null,
+          };
+        });
+      }),
+    );
+    const items = perListing
+      .flat()
+      .sort((x, y) => (y.at ?? "").localeCompare(x.at ?? ""))
+      .slice(0, 25);
     return NextResponse.json({ items });
   }
 

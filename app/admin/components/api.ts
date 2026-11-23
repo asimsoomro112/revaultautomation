@@ -100,6 +100,8 @@ export interface ActivityItem {
   at: string | null;
   by: string | null;
   detail: string | null;
+  /** Set on finalized events: how many photos the extraction actually saw. */
+  photo_count?: number | null;
 }
 
 export interface BannedSeller {

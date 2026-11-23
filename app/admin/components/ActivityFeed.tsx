@@ -71,7 +71,10 @@ export default function ActivityFeed() {
                   </td>
                   <td>{it.listing_id ?? "—"}</td>
                   <td>{it.by ?? "—"}</td>
-                  <td>{it.detail ?? "—"}</td>
+                  <td>
+                    {it.detail ?? "—"}
+                    {typeof it.photo_count === "number" ? ` · ${it.photo_count} photos` : ""}
+                  </td>
                 </tr>
               ))}
             </tbody>

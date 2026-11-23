@@ -141,6 +141,24 @@ Workflow: `.agents/workflows/verify.md` (lint → typecheck → test).
 - Tests: the burst-combine tests fail without the activity guards (re-check
   discard, re-arm cap, no-photos skip, download self-retry).
 
+## Activity feed 500 (2026-11-23 — Asim's Log screenshot, FAILED_PRECONDITION)
+- GET /api/admin/activity 500d: `collectionGroup("events").orderBy("at","desc")`
+  needs a COLLECTION_GROUP_DESC composite index for collection `events` +
+  field `at` (Firestore: "The query requires a COLLECTION_GROUP_DESC index
+  for collection events and field at"). The old code comment claiming
+  "collectionGroup + single-field orderBy needs no composite index" was
+  wrong, and firestore.indexes.json has no events index (only listings
+  status+created_at — also still undeployed).
+- FIX: the endpoint no longer uses collectionGroup — it lists listings
+  (orderBy created_at desc, limit 50), reads each listing's events
+  (orderBy at desc, limit 10) and merges newest-first in memory (same
+  pattern as the queue endpoint; single-collection orderBy uses the auto
+  single-field index, so no index deploy is needed). The feed now also
+  surfaces `photo_count` on finalized events (the number that decides
+  whether a burst's photos all reached extraction).
+- Test: the admin-api mock's collectionGroup THROWS now, so any future
+  use fails the test instead of prod.
+
 ## Claude audit fixes (2026-11-23)
 - **Test clock:** `sendSafe` (and any 24h-window check) must use the injected
   clock — `isWithinWindow(x, Date.parse(deps.now()))` — never `Date.now()`.
