@@ -21,6 +21,11 @@ import { getGeminiClient } from "./gemini";
 import type { ExtractedItem, Lang } from "./types";
 
 const MAX_CAPTION_LEN = 2200;
+// Room reserved for the guaranteed tail (CTA line ≤ 38 chars + up to 3
+// derived hashtags ≤ ~90 chars). The tail is bounded well under this
+// reserve, so capping the body to MAX − reserve before appending
+// guarantees the finished caption fits without ever truncating the tail.
+const TAIL_RESERVE = 250;
 const MAX_HASHTAGS = 5;
 const MIN_HASHTAGS = 3;
 
@@ -102,19 +107,26 @@ function stripContactInfo(caption: string): string {
     .trim();
 }
 
-/** Enforce the 2200-char Instagram limit without splitting a code point. */
-function capLength(caption: string): string {
+/** Enforce a char limit without splitting a code point. */
+function capLength(caption: string, max: number = MAX_CAPTION_LEN): string {
   const chars = Array.from(caption);
-  if (chars.length <= MAX_CAPTION_LEN) return caption;
-  return chars.slice(0, MAX_CAPTION_LEN - 1).join("") + "…";
+  if (chars.length <= max) return caption;
+  return chars.slice(0, max - 1).join("") + "…";
 }
 
 export async function buildCaption(extracted: ExtractedItem, lang: Lang): Promise<string> {
   const cta = getEnv().CAPTION_CTA;
   let caption = await getGeminiClient().writeCaption(extracted, lang, cta);
-  caption = ensureCta(caption.trim(), cta);
+  // Cap the model-written BODY first, reserving room for the CTA line and
+  // hashtags appended next. Capping the finished caption last (the old
+  // order) amputated the very CTA/hashtags the previous steps guaranteed.
+  caption = capLength(caption.trim(), MAX_CAPTION_LEN - TAIL_RESERVE);
+  caption = ensureCta(caption, cta);
   caption = ensureHashtags(caption, extracted);
   caption = stripContactInfo(caption);
+  // Safety net only: the reserve above bounds the tail, so the finished
+  // caption fits; this fires only if a future edit grows the tail past
+  // the reserve.
   caption = capLength(caption);
   return caption.trim();
 }

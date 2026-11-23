@@ -96,6 +96,26 @@ describe("buildCaption post-processing", () => {
     expect(Array.from(out).length).toBeLessThanOrEqual(2200);
   });
 
+  it("an over-long model caption keeps the CTA and hashtags (cap the body, not the tail)", async () => {
+    mockedWriteCaption.mockResolvedValue("x".repeat(3000));
+    const out = await buildCaption(extracted(), "en");
+    expect(Array.from(out).length).toBeLessThanOrEqual(2200);
+    expect(out).toContain("DM to buy 🤍");
+    const n = countHashtags(out);
+    expect(n).toBeGreaterThanOrEqual(3);
+    expect(n).toBeLessThanOrEqual(5);
+  });
+
+  it("an over-long model caption that already has a CTA keeps it", async () => {
+    mockedWriteCaption.mockResolvedValue(
+      "y".repeat(3000) + "\n\nDM to buy 🤍\n\n#prelovedpakistan #thriftpakistan #prelovedfashion",
+    );
+    const out = await buildCaption(extracted(), "en");
+    expect(Array.from(out).length).toBeLessThanOrEqual(2200);
+    expect(out).toContain("DM to buy 🤍");
+    expect(countHashtags(out)).toBeGreaterThanOrEqual(3);
+  });
+
   it("passes lang and cta through to Gemini", async () => {
     mockedWriteCaption.mockResolvedValue("caption");
     const ex = extracted();
