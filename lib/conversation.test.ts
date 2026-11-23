@@ -108,6 +108,17 @@ describe("isHumanKeyword", () => {
     expect(isHumanKeyword("کوئی انسان ہے")).toBe(true);
     expect(isHumanKeyword("مجھے انسان چاہیے")).toBe(true);
   });
+  it("bare 'admi/banda/insan hai' without koi or ? is NOT a handoff (gender answer)", () => {
+    // "admi hai" / "banda hai" is a plausible terse answer to the gender
+    // question "Yeh kis ke liye hai?" — the bare-hai branch must require
+    // "koi" or a question mark, or one false positive permanently mutes
+    // the seller (human_needed is sticky, never cleared).
+    expect(isHumanKeyword("admi hai")).toBe(false);
+    expect(isHumanKeyword("banda hai")).toBe(false);
+    expect(isHumanKeyword("insan hai")).toBe(false);
+    expect(isHumanKeyword("koi banda hai")).toBe(true);
+    expect(isHumanKeyword("banda hai?")).toBe(true);
+  });
 });
 
 describe("parseQuickReplyPayload", () => {
