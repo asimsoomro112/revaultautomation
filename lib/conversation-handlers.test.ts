@@ -76,6 +76,19 @@ describe("handleMessage: IDLE routing", () => {
     expect(deps.fdb.convos.get(IGSID)!.active_listing_id).toBeNull();
     expect(deps.meta.sent[0]!.opts.text).toMatch(/limit|kal/i);
   });
+
+  it("daily limit resets on a new PKT day (yesterday's listings do not count)", async () => {
+    deps.maxListingsPerSellerPerDay = 1;
+    deps.gemini.classifyIntentImpl = async () => ({ intent: "SELLER_SUBMIT", confidence: 0.9, lang: "roman" });
+    const convo0 = await deps.db.getOrCreateConversation(IGSID);
+    convo0.listings_today = 1;
+    convo0.listings_day = "2026-09-29"; // yesterday — now is 2026-09-30
+    await handleMessage(payload("mid_1"), makeInbound("text", "mid_1", { text: "bechni hai" }), deps);
+    const convo = deps.fdb.convos.get(IGSID)!;
+    expect(convo.active_listing_id).not.toBeNull();
+    expect(convo.listings_day).toBe("2026-09-30");
+    expect(convo.listings_today).toBe(1); // reset to 0, then +1 for the new listing
+  });
 });
 
 describe("handleMessage: guards", () => {

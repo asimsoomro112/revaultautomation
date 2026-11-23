@@ -46,6 +46,7 @@ import {
   unsupportedReply,
 } from "./prompts";
 import { log, redactPII } from "./log";
+import { pktDay } from "./db";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -571,6 +572,14 @@ export async function ensureActiveListing(
       return { listing: existing, isNew: false };
     }
     convo.active_listing_id = null; // stale pointer (submitted/rejected/…)
+  }
+  // Daily limit rolls over at midnight PKT: listings_day tracks the day the
+  // counter belongs to. Without this reset, listings_today was a lifetime
+  // counter — a seller who ever hit the limit was locked out forever.
+  const today = pktDay(new Date(nowIso));
+  if (convo.listings_day !== today) {
+    convo.listings_today = 0;
+    convo.listings_day = today;
   }
   if (convo.listings_today >= deps.maxListingsPerSellerPerDay) return { listing: null, isNew: false };
   const { listing, isNew } = await deps.db.getOrCreateActiveListing(convo.igsid, nowIso);
