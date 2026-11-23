@@ -82,6 +82,19 @@ describe("isHumanKeyword", () => {
   it("does not match ordinary chatter", () => {
     expect(isHumanKeyword("ye shirt kitne ki hai?")).toBe(false);
     expect(isHumanKeyword("humanity is nice")).toBe(false);
+    // False positives that used to mute the seller permanently: the gender
+    // answer, and words containing the bare substrings.
+    expect(isHumanKeyword("admi ke liye hai")).toBe(false);
+    expect(isHumanKeyword("bandage lag gaya hai")).toBe(false);
+    expect(isHumanKeyword("insaniyat achi cheez hai")).toBe(false);
+    expect(isHumanKeyword("koi banda le ga?")).toBe(false);
+  });
+  it("still matches real handoff phrasing", () => {
+    expect(isHumanKeyword("admi se baat karni hai")).toBe(true);
+    expect(isHumanKeyword("insan se baat karni hai")).toBe(true);
+    expect(isHumanKeyword("operator se baat")).toBe(true);
+    expect(isHumanKeyword("koi banda hai?")).toBe(true);
+    expect(isHumanKeyword("asli banda chahiye")).toBe(true);
   });
 });
 

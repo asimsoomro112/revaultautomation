@@ -114,7 +114,12 @@ export function detectLang(texts: string[]): Lang {
 // Pure: human handoff keyword
 // ---------------------------------------------------------------------------
 
-const HUMAN_RE = /\bhuman\b|insan|banda|admi|real\s*person|asli\s+(banda|insan)|operator\s*(se)?\s*baat/i;
+// Handoff intent needs a person-to-talk-to phrasing, not just the word:
+// bare "insan|banda|admi" matched ordinary answers ("admi ke liye hai" is
+// the gender answer; "bandage" and "insaniyat" contain the substring) and
+// permanently muted the seller (human_needed is never cleared).
+const HUMAN_RE =
+  /\bhuman\b|real\s*person|asli\s+(banda|insan)|operator\s*(se)?\s*baat|(insan|banda|admi)\s*(se\s*)?baat|(koi\s+)?(insan|banda|admi)\s+(hai|hain|ho)\s*\?/i;
 
 /** True if the text asks for a human (English + Roman-Urdu variants). */
 export function isHumanKeyword(text: string): boolean {
