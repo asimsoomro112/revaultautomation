@@ -170,6 +170,21 @@ function makeDeps(state: FakeState): WorkerDeps {
         state.listings.set(id, next);
         return { doc: next, claimed: true, alreadyPublished: false, preStatus };
       }
+      // Mirror the prod claim: a PUBLISHING listing with a free (expired or
+      // released) lease is claimable — the poll worker claims the
+      // media_publish step after the publish worker released its lease.
+      if (doc.status === "PUBLISHING") {
+        const lockMs = doc.publish.locked_until ? new Date(doc.publish.locked_until).getTime() : 0;
+        if (!doc.publish.locked_until || lockMs < Date.now()) {
+          const next: ListingDoc = {
+            ...doc,
+            publish: { ...doc.publish, locked_until: new Date(Date.now() + 600_000).toISOString() },
+          };
+          state.listings.set(id, next);
+          return { doc: next, claimed: true, alreadyPublished: false, preStatus };
+        }
+        return { doc, claimed: false, alreadyPublished: false, preStatus };
+      }
       return { doc, claimed: false, alreadyPublished: false, preStatus };
     },
     getListing: async (id) => state.listings.get(id) ?? null,
@@ -242,6 +257,27 @@ describe("idempotency — duplicate deliveries publish exactly once", () => {
     }
     expect(state.meta.calls.mediaPublish).toBe(1);
     expect(state.dms).toHaveLength(1);
+  });
+
+  it("concurrent duplicate parent polls → single media_publish", async () => {
+    const r1 = await handlePublish("lst1", deps);
+    expect(r1.outcome).toBe("containers-created");
+    const [c1, c2] = state.polls as [PollContainerPayload, PollContainerPayload];
+    expect(await handlePollContainer(c1!, deps)).toMatchObject({ outcome: "waiting-children" });
+    expect(await handlePollContainer(c2!, deps)).toMatchObject({ outcome: "parent-created" });
+    expect(state.polls).toHaveLength(3);
+    const parent = state.polls[2]!;
+
+    // Two concurrent deliveries of the same parent poll (QStash redelivery):
+    // both pass the entry guard before either persists media_id.
+    const [a, b] = await Promise.all([
+      handlePollContainer({ ...parent }, deps),
+      handlePollContainer({ ...parent }, deps),
+    ]);
+    expect(state.meta.calls.mediaPublish).toBe(1);
+    expect([a.outcome, b.outcome]).toContain("published");
+    expect(state.listings.get("lst1")!.status).toBe("PUBLISHED");
+    expect(state.dms).toHaveLength(1); // exactly one seller permalink DM
   });
 
   it("crash between media_publish and the PUBLISHED write recovers without a second media_publish", async () => {

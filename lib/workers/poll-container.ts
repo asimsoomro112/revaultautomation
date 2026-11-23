@@ -222,12 +222,12 @@ async function handleFinished(
 ): Promise<PollOutcome> {
   const { listing_id: listingId, container_id: containerId, role } = payload;
   if (role === "parent") {
-    return publishNow(deps, listing, containerId);
+    return publishNow(deps, listing, payload);
   }
   const ids = listing.publish.container_ids;
   const isSingle = ids.length === 1 && ids[0] === containerId;
   if (isSingle) {
-    return publishNow(deps, listing, containerId);
+    return publishNow(deps, listing, payload);
   }
   const allDone = ids.every((id) => listing.publish.container_status[id] === "FINISHED");
   if (!allDone || listing.publish.parent_container_id) {
@@ -287,13 +287,22 @@ async function requeueBackoff(  deps: WorkerDeps,
  * Publish a FINISHED container. media_publish is called AT MOST ONCE per
  * listing: success stores media_id immediately, so any retry/recovery takes
  * the idempotent getPermalink path instead of calling media_publish again.
+ * The media_publish step is claimed transactionally first: two concurrent
+ * poll deliveries can both pass the entry guard before either persists
+ * media_id, and only the claimer may call publishContainer. A delivery
+ * that loses the claim re-checks media_id (the winner may have published
+ * since this delivery read the listing) and otherwise re-enqueues the poll
+ * — a dropped poll would strand the pipeline. The claim also doubles as a
+ * status re-check: a REJECTED listing is not claimable, so its in-flight
+ * polls can never publish it.
  */
 async function publishNow(
   deps: WorkerDeps,
   listing: ListingDoc,
-  containerId: string,
+  payload: PollContainerPayload,
 ): Promise<PollOutcome> {
   const listingId = listing.id;
+  const containerId = payload.container_id;
   const meta = deps.getMeta();
 
   const settings = await liveSettings(deps); // throws KillSwitchEngaged → caller parks
@@ -310,6 +319,23 @@ async function publishNow(
     return { outcome: "dry-run" };
   }
 
+  const claim = await deps.claimListing(listingId);
+  if (!claim) return { outcome: "missing" };
+  if (claim.alreadyPublished) {
+    if (claim.doc.publish.media_id) {
+      return finalizePublished(deps, claim.doc, claim.doc.publish.media_id);
+    }
+    return { outcome: "already-published" };
+  }
+  if (!claim.claimed) {
+    const fresh = await deps.getListing(listingId);
+    if (fresh?.publish.media_id) {
+      return finalizePublished(deps, fresh, fresh.publish.media_id);
+    }
+    return requeueBackoff(deps, listing, payload, "publish claim held by another worker");
+  }
+  const claimed = claim.doc;
+
   let mediaId: string;
   try {
     mediaId = await meta.publishContainer(containerId);
@@ -318,15 +344,15 @@ async function publishNow(
     // the admin with the container id so they can verify on the IG profile
     // before any manual retry.
     const msg = err instanceof Error ? err.message : String(err);
-    await failListing(deps, listing, `media_publish failed for container ${containerId}: ${msg}`);
+    await failListing(deps, claimed, `media_publish failed for container ${containerId}: ${msg}`);
     return { outcome: "failed", error: msg };
   }
   // media_id persisted BEFORE the permalink fetch — a crash here recovers via
   // getPermalink, never via a second media_publish.
-  await deps.saveListing(listingId, { publish: { ...listing.publish, media_id: mediaId } });
+  await deps.saveListing(listingId, { publish: { ...claimed.publish, media_id: mediaId } });
 
   const permalink = await meta.getPermalink(mediaId);
-  return finalizePublished(deps, listing, mediaId, permalink);
+  return finalizePublished(deps, claimed, mediaId, permalink);
 }
 
 /** Shared finalize: mark PUBLISHED, bump counters, DM the seller. */

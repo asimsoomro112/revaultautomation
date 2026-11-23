@@ -203,6 +203,10 @@ export async function handlePublish(
         container_ids: containerIds,
         container_status,
         attempts: listing.publish.attempts,
+        // Release the claim lease: the poll worker owns the pipeline from
+        // here and must be able to claim the media_publish step — its
+        // claim would otherwise be blocked by this worker's 10-min lease.
+        locked_until: null,
       },
     });
     for (const id of containerIds) {
