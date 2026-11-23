@@ -4,6 +4,7 @@
  */
 import { beforeEach, describe, expect, it } from "vitest";
 import { handleMessage, sendSafe } from "./conversation";
+import { MetaApiError } from "./meta";
 import {
   IGSID,
   NOW,
@@ -181,6 +182,19 @@ describe("handleMessage: 24h window", () => {
     // Meta's window error then flips window_open=false and the send is swallowed.
     expect(deps.fdb.convos.get(IGSID)!.window_open).toBe(false);
     expect(deps.meta.sent).toHaveLength(1); // no new successful send
+  });
+
+  it("recipient error (2534014) alerts the admin — the window is not closed", async () => {
+    const convo = await deps.db.getOrCreateConversation(IGSID);
+    convo.last_user_msg_at = NOW; // window open, so the send is attempted
+    convo.window_open = true;
+    deps.meta.sendFailsWith = new MetaApiError("Invalid recipient id", 10, 2534014, 400);
+    const res = await sendSafe(deps, convo, { text: "hello" });
+    expect(res.sent).toBe(false);
+    // A bad recipient id is a config bug, not a closed window: the window
+    // stays open and the admin is told to check IG_USER_ID.
+    expect(deps.fdb.convos.get(IGSID)!.window_open).toBe(true);
+    expect(deps.alerts.some((a) => a.text.includes("2534014"))).toBe(true);
   });
 });
 

@@ -492,6 +492,23 @@ export async function sendSafe(
       convo.window_open = false;
       await persistConvo(deps, convo);
       log.warn("message.window_error_from_meta", { igsid: convo.igsid });
+    } else if (err instanceof MetaApiError && err.isRecipientError()) {
+      // Config bug, not a closed window: the recipient id (IG_USER_ID /
+      // seller IGSID) is wrong. Alert the admin — silently swallowing it
+      // would look like the seller never got a reply. The alert itself is
+      // best-effort: sendSafe never throws.
+      log.error("message.recipient_error", { igsid: convo.igsid, subcode: 2534014 });
+      try {
+        await deps.notifyAdmin(
+          `⚠️ IG send failed (subcode 2534014, bad recipient id) for seller ${convo.igsid} — check IG_USER_ID / the seller's app-scoped id.`,
+          { igsid: convo.igsid },
+        );
+      } catch (notifyErr) {
+        log.warn("message.recipient_alert_failed", {
+          igsid: convo.igsid,
+          err: String(notifyErr).slice(0, 160),
+        });
+      }
     } else {
       log.error("message.send_failed", { igsid: convo.igsid, error: err instanceof Error ? err.message : String(err) });
     }

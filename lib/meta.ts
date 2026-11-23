@@ -69,9 +69,25 @@ export class MetaApiError extends Error {
     super(message);
     this.name = "MetaApiError";
   }
-  /** True when the send failed because the 24h messaging window is closed. */
+  /**
+   * True when the send failed because the 24h messaging window is closed.
+   * The window error carries subcode 2534022 (or the message says so).
+   * Bare code 10 is NOT enough — it is a broad permission family, and
+   * treating any code-10 error as window-closed suppressed sends for a
+   * day even though the window was open.
+   */
   isWindowError(): boolean {
-    return this.code === 10 || /24 hours|messaging window/i.test(this.message);
+    return this.subcode === 2534022 || /24 hours|messaging window/i.test(this.message);
+  }
+
+  /**
+   * True when the send failed because the recipient id is wrong
+   * (subcode 2534014 — e.g. a non-app-scoped user id was used as the
+   * recipient). A config bug, not a closed window: the caller must alert
+   * a human instead of silently swallowing it.
+   */
+  isRecipientError(): boolean {
+    return this.subcode === 2534014;
   }
 }
 

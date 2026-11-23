@@ -170,17 +170,41 @@ describe("publish + permalink + quota", () => {
 });
 
 describe("error mapping", () => {
-  it("maps code/subcode/status and detects the 24h window error by code", async () => {
+  it("maps code/subcode/status and detects the 24h window error by subcode", async () => {
     mockJson(
-      { error: { message: "Some error", code: 10, error_subcode: 123, fbtrace_id: "x" } },
+      { error: { message: "Some error", code: 10, error_subcode: 2534022, fbtrace_id: "x" } },
       400,
     );
     const err = await getMetaClient().sendMessage("igsid1", { text: "hi" }).catch((e) => e);
     expect(err).toBeInstanceOf(MetaApiError);
     expect(err.code).toBe(10);
-    expect(err.subcode).toBe(123);
+    expect(err.subcode).toBe(2534022);
     expect(err.status).toBe(400);
     expect(err.isWindowError()).toBe(true);
+    expect(err.isRecipientError()).toBe(false);
+  });
+
+  it("code 10 without the window subcode is NOT a window error", async () => {
+    // Bare code 10 is a broad permission family, not the 24h window — the
+    // old check marked ANY code-10 error as window-closed and suppressed
+    // sends for a day even though the window was open.
+    mockJson(
+      { error: { message: "Some permission error", code: 10, error_subcode: 123, fbtrace_id: "x" } },
+      400,
+    );
+    const err = await getMetaClient().sendMessage("igsid1", { text: "hi" }).catch((e) => e);
+    expect(err.isWindowError()).toBe(false);
+    expect(err.isRecipientError()).toBe(false);
+  });
+
+  it("subcode 2534014 is a recipient error, not a window error", async () => {
+    mockJson(
+      { error: { message: "Invalid recipient id", code: 10, error_subcode: 2534014, fbtrace_id: "x" } },
+      400,
+    );
+    const err = await getMetaClient().sendMessage("igsid1", { text: "hi" }).catch((e) => e);
+    expect(err.isWindowError()).toBe(false);
+    expect(err.isRecipientError()).toBe(true);
   });
 
   it("detects the window error by message", async () => {
