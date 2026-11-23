@@ -15,6 +15,7 @@
  * @/lib/moderation (Phase 3) and vitest.mock'ed in tests.
  */
 import type { ConversationDoc, FinalizePhotosPayload, ListingDoc, ModerationResult } from "./types";
+import { GeminiError } from "./gemini";
 import { applyModeration } from "./moderation";
 import { dhash } from "./dhash";
 import {
@@ -32,6 +33,10 @@ export interface FinalizeDeps extends Deps {
   downloadBytes: (storagePath: string) => Promise<Buffer>;
 }
 
+/** Delayed retries of a failed finalize before failing closed (see catch). */
+const FINALIZE_MAX_RETRIES = 2;
+const FINALIZE_RETRY_DELAY_SEC = 60;
+
 const PROCESSABLE = new Set(["DRAFT", "NEEDS_INFO"]);
 
 async function markNeedsReview(
@@ -40,8 +45,10 @@ async function markNeedsReview(
   convo: ConversationDoc,
   note: string,
 ): Promise<void> {
+  // Narrow patch, not a full-doc save: a concurrent photo/chat append must
+  // never be clobbered by this status transition.
+  await deps.db.saveListing(listing.id, { status: "NEEDS_REVIEW" });
   listing.status = "NEEDS_REVIEW";
-  await deps.db.saveListing(listing.id, { ...listing });
   await deps.db.appendListingEvent(listing.id, { type: "needs_review", note: note.slice(0, 300) });
   setConversationState(convo, "IDLE");
   convo.active_listing_id = null;
@@ -93,13 +100,27 @@ export async function handleFinalizePhotos(
         log.warn("finalize.dhash_failed", { listing_id: listing.id, index: i });
       }
     }
-    await deps.db.saveListing(listing.id, { photos: listing.photos });
+    // Persist hashes transactionally, matched by storage_path against the
+    // FRESH photos array: a photo appended after this run's read must survive.
+    const phashByPath = new Map(listing.photos.filter((p) => p.phash).map((p) => [p.storage_path, p.phash]));
+    if (phashByPath.size > 0) {
+      await deps.db.mutateListing(listing.id, (doc) => ({
+        patch: {
+          photos: doc.photos.map((p) => {
+            const ph = phashByPath.get(p.storage_path);
+            return ph ? { ...p, phash: ph } : p;
+          }),
+        },
+        result: undefined,
+      }));
+    }
 
     // 2. ONE Gemini vision call: extraction + moderation.
     const vision = await deps.gemini.extractListing(buffers, listing.chat_text ?? "", convo.lang);
     listing.extracted = vision.extracted;
     listing.missing = vision.missing;
-    await deps.db.saveListing(listing.id, { ...listing });
+    // Narrow patch, not a full-doc save (see markNeedsReview).
+    await deps.db.saveListing(listing.id, { extracted: vision.extracted, missing: vision.missing });
     await deps.db.appendListingEvent(listing.id, {
       type: "finalized",
       photo_count: buffers.length,
@@ -116,7 +137,8 @@ export async function handleFinalizePhotos(
       per_image: vision.moderation.per_image,
     };
     listing.moderation = moderation;
-    await deps.db.saveListing(listing.id, { ...listing });
+    // Narrow patch, not a full-doc save (see markNeedsReview).
+    await deps.db.saveListing(listing.id, { moderation });
 
     // 3b. Record perceptual hashes in the duplicate index. Done for every
     // verdict (after moderation has read the index, so a listing never
@@ -131,7 +153,8 @@ export async function handleFinalizePhotos(
     // 4. Branch on verdict.
     if (mod.verdict === "FAIL") {
       listing.status = "REJECTED";
-      await deps.db.saveListing(listing.id, { ...listing });
+      // Narrow patch, not a full-doc save (see markNeedsReview).
+      await deps.db.saveListing(listing.id, { status: "REJECTED" });
       await deps.db.appendListingEvent(listing.id, { type: "rejected", reasons: mod.reasons });
       setConversationState(convo, "IDLE");
       convo.active_listing_id = null;
@@ -151,7 +174,8 @@ export async function handleFinalizePhotos(
     if (!check.ok) {
       listing.status = "NEEDS_INFO";
       listing.missing = check.missing;
-      await deps.db.saveListing(listing.id, { ...listing });
+      // Narrow patch, not a full-doc save (see markNeedsReview).
+      await deps.db.saveListing(listing.id, { status: "NEEDS_INFO", missing: check.missing });
       setConversationState(convo, "NEEDS_INFO");
       await deps.db.saveConversation(convo.igsid, { ...convo });
       const q = nextQuestion(check.missing, convo.lang, listing.photos.length);
@@ -162,10 +186,45 @@ export async function handleFinalizePhotos(
     await moveToConfirm(deps, convo, listing);
     return { ok: true };
   } catch (err) {
-    // Fail closed: never auto-pass on error.
+    // A transient failure (Gemini 503/429 spike, network blip, storage
+    // hiccup) must not strand the listing in review with nothing extracted
+    // on the first spike — retry once after a delay, then fail closed.
+    // A non-retryable Gemini error (bad schema, no buffers) fails the same
+    // way again, so it fails closed at once.
     const msg = err instanceof Error ? err.message : String(err);
+    const attempt = payload.attempt ?? 0;
+    if (attempt < FINALIZE_MAX_RETRIES && isRetryableFinalizeError(err)) {
+      log.warn("finalize.retry_scheduled", {
+        listing_id: listing.id,
+        attempt: attempt + 1,
+        error: msg.slice(0, 200),
+      });
+      await deps.db.appendListingEvent(listing.id, {
+        type: "finalize_retry",
+        attempt: attempt + 1,
+        error: msg.slice(0, 200),
+      });
+      await deps.enqueueWorker(
+        "finalize-photos",
+        {
+          kind: "finalize-photos",
+          listing_id: listing.id,
+          photo_at: payload.photo_at,
+          attempt: attempt + 1,
+        },
+        { delaySec: FINALIZE_RETRY_DELAY_SEC },
+      );
+      return { ok: true };
+    }
+    // Fail closed: never auto-pass on error.
     log.error("finalize.failed_closed", { listing_id: listing.id, error: msg.slice(0, 300) });
     await markNeedsReview(deps, listing, convo, `finalize error (fail closed): ${msg}`);
     return { ok: true };
   }
+}
+
+/** True when a finalize failure is worth one delayed retry. */
+function isRetryableFinalizeError(err: unknown): boolean {
+  if (err instanceof GeminiError) return err.retryable;
+  return true;
 }

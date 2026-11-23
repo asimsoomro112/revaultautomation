@@ -15,6 +15,7 @@ import {
   mapGender,
   matchTypedAnswer,
   nextQuestion,
+  parseDetailsDump,
   parseQuickReplyPayload,
   readyForConfirm,
   setConversationState,
@@ -169,6 +170,12 @@ describe("coerceFieldValue", () => {
     expect(coerceFieldValue("price_pkr", "free")).toEqual({ ok: false });
     expect(coerceFieldValue("price_pkr", "-5")).toEqual({ ok: false });
   });
+  it("parses 'k' prices as thousands (2k → 2000, not 2)", () => {
+    expect(coerceFieldValue("price_pkr", "2k")).toEqual({ ok: true, value: 2000 });
+    expect(coerceFieldValue("price_pkr", "1.5k")).toEqual({ ok: true, value: 1500 });
+    expect(coerceFieldValue("price_pkr", "2k PKR")).toEqual({ ok: true, value: 2000 });
+    expect(coerceFieldValue("price_pkr", "-2k")).toEqual({ ok: false });
+  });
   it("maps condition aliases", () => {
     expect(mapCondition("like new")).toBe("like_new");
     expect(mapCondition("10/10 condition")).toBe("like_new");
@@ -228,5 +235,45 @@ describe("applyFieldValue", () => {
 describe("SPAM_MAX_PER_HOUR", () => {
   it("is 12 per the plan", () => {
     expect(SPAM_MAX_PER_HOUR).toBe(12);
+  });
+});
+
+describe("parseDetailsDump", () => {
+  // Nina's real message, 2026-11-23 — arrived after finalize, so the bot
+  // must parse it locally instead of losing it to a single-field coercion.
+  const NINA_DUMP = [
+    "Brand: Tinnie Tots",
+    "Size: 5-6 years",
+    "Condition: 10/10",
+    "Original price: 3500",
+    "Discounted price: 2k",
+    "Dc: 250",
+    "City: Lahore",
+    "Measurements",
+    'Length: 25.5"',
+  ].join("\n");
+
+  it("parses Nina's dump: every field, discounted price wins", () => {
+    expect(parseDetailsDump(NINA_DUMP)).toEqual([
+      { field: "brand", rawValue: "Tinnie Tots" },
+      { field: "size", rawValue: "5-6 years" },
+      { field: "condition", rawValue: "10/10" },
+      { field: "price_pkr", rawValue: "2k" },
+      { field: "city", rawValue: "Lahore" },
+      { field: "measurements", rawValue: '25.5"' },
+    ]);
+  });
+  it("falls back to the original price when no discounted price is given", () => {
+    expect(parseDetailsDump("Brand: Zara\nOriginal price: 3500")).toEqual([
+      { field: "brand", rawValue: "Zara" },
+      { field: "price_pkr", rawValue: "3500" },
+    ]);
+  });
+  it("skips unknown keys and lines without a value", () => {
+    expect(parseDetailsDump("Dc: 250\nMeasurements\nhello")).toEqual([]);
+    expect(parseDetailsDump("Price: 2000\nPrice: 3000")).toEqual([{ field: "price_pkr", rawValue: "2000" }]);
+  });
+  it("returns [] for free text with no Key: value lines", () => {
+    expect(parseDetailsDump("mujhe ye bechni hai")).toEqual([]);
   });
 });

@@ -7,9 +7,10 @@
  * signature, zod-parses the payload, and wires real dependencies.
  *
  * Behaviour:
- * - image → download bytes NOW to raw/{listingId}/{photoId}.jpg (existing
- *   active DRAFT listing for the sender, else a new one), record the photo,
- *   ensure the conversation is COLLECTING, (re)schedule finalize-photos after
+ * - image → download bytes NOW to raw/{listingId}/{photoId}.jpg (the sender's
+ *   active DRAFT/NEEDS_INFO listing via transactional getOrCreateActiveListing,
+ *   else a new one), append the photo transactionally, ensure the
+ *   conversation is COLLECTING, (re)schedule finalize-photos after
  *   PHOTO_DEBOUNCE_SECONDS carrying photo_at = this photo's timestamp.
  * - text | quick_reply | unsupported → hand to the message worker (Phase 2
  *   owns replies, incl. the polite "send photos as images" reply).
@@ -57,6 +58,7 @@ const finalizePhotosPayloadSchema = z.object({
   kind: z.literal("finalize-photos"),
   listing_id: z.string(),
   photo_at: z.string(),
+  attempt: z.number().int().nonnegative().optional(),
 });
 
 const publishPayloadSchema = z.object({
@@ -92,13 +94,22 @@ export interface EnqueueFn {
 
 export interface IngestDeps {
   downloadImage: (url: string, destPath: string) => Promise<{ bytes: number }>;
-  getOrCreateConversation: (igsid: string) => Promise<ConversationDoc>;
   saveConversation: (igsid: string, patch: Partial<ConversationDoc>) => Promise<ConversationDoc>;
-  getListing: (id: string) => Promise<ListingDoc | null>;
-  createListing: (doc: ListingDoc) => Promise<void>;
-  saveListing: (id: string, patch: Partial<ListingDoc>) => Promise<void>;
-  blankListingDoc: (id: string, sellerIgsid: string, nowIso: string) => ListingDoc;
-  newListingId: () => string;
+  /**
+   * Transactional read-modify-write for a listing (see lib/db.ts
+   * mutateListing). Photo appends MUST use this — a getListing +
+   * saveListing pair loses photos when burst photos ingest concurrently.
+   */
+  mutateListing: <T>(
+    id: string,
+    mutate: (doc: ListingDoc) => { patch: Partial<ListingDoc>; result: T },
+  ) => Promise<T>;
+  /**
+   * Transactional find-or-create of the sender's active DRAFT/NEEDS_INFO
+   * listing (see lib/db.ts getOrCreateActiveListing). Concurrent first
+   * photos must not each create their own listing.
+   */
+  getOrCreateActiveListing: (igsid: string, nowIso: string) => Promise<{ listing: ListingDoc; isNew: boolean }>;
   enqueue: EnqueueFn;
   getPhotoDebounceSeconds: () => number;
   nowIso?: () => string;
@@ -127,22 +138,16 @@ async function handleImage(message: NormalizedInbound, deps: IngestDeps, now: st
     return { action: "enqueued-message" };
   }
 
-  // Reuse the sender's active DRAFT listing; otherwise start a new one.
-  const conv = await deps.getOrCreateConversation(igsid);
-  let listing: ListingDoc | null = null;
-  if (conv.active_listing_id) {
-    const existing = await deps.getListing(conv.active_listing_id);
-    if (existing && existing.status === "DRAFT") listing = existing;
-  }
-  if (!listing) {
-    const id = deps.newListingId();
-    listing = deps.blankListingDoc(id, igsid, now);
-    await deps.createListing(listing);
-    log.info("ingest: new listing", { listingId: id });
-  }
+  // Reuse the sender's active DRAFT *or NEEDS_INFO* listing; otherwise start
+  // a new one — atomically (see getOrCreateActiveListing). NEEDS_INFO matters:
+  // when the bot asked for a missing photo, the seller's next photo must land
+  // on the SAME listing, not spawn a second one.
+  const { listing } = await deps.getOrCreateActiveListing(igsid, now);
   const listingId = listing.id;
 
-  // Download bytes NOW — Meta CDN URLs expire, so this cannot wait.
+  // Download bytes NOW — Meta CDN URLs expire, so this cannot wait. The
+  // download happens OUTSIDE the transaction (no network I/O inside it);
+  // the append below is the transactional part.
   const photoId = sanitizePhotoId(message.mid);
   const destPath = `raw/${listingId}/${photoId}.jpg`;
 
@@ -153,8 +158,17 @@ async function handleImage(message: NormalizedInbound, deps: IngestDeps, now: st
   // finalize is already armed, so just touch last_photo_at and re-arm below.
   // Skipping the download also avoids failing on a Meta CDN URL that has
   // expired since the first delivery.
-  const alreadySaved = listing.photos.some((p) => p.storage_path === destPath);
+  // The check + append run INSIDE mutateListing: burst photos ingest
+  // concurrently, and a getListing + saveListing pair loses photos — two jobs
+  // read the same array, each appends its own photo, last writer wins
+  // (2026-11-23: Nina sent 3 photos, only 1 survived in lst_a5fa2b817b16).
   let downloadedBytes = 0;
+  const alreadySaved = await deps.mutateListing(listingId, (doc) => {
+    if (doc.photos.some((p) => p.storage_path === destPath)) {
+      return { patch: { last_photo_at: now }, result: true };
+    }
+    return { patch: { last_photo_at: now }, result: false };
+  });
   if (!alreadySaved) {
     const { bytes } = await deps.downloadImage(message.image_url, destPath);
     downloadedBytes = bytes;
@@ -166,12 +180,16 @@ async function handleImage(message: NormalizedInbound, deps: IngestDeps, now: st
       phash: "",
       received_at: now,
     };
-    await deps.saveListing(listingId, {
-      photos: [...listing.photos, photo],
-      last_photo_at: now,
+    // Second transaction: append the downloaded photo. The alreadySaved
+    // check above ran before the download, so re-check here — a concurrent
+    // retry of this same mid could have appended it meanwhile.
+    await deps.mutateListing(listingId, (doc) => {
+      if (doc.photos.some((p) => p.storage_path === destPath)) {
+        return { patch: { last_photo_at: now }, result: true };
+      }
+      return { patch: { photos: [...doc.photos, photo], last_photo_at: now }, result: false };
     });
   } else {
-    await deps.saveListing(listingId, { last_photo_at: now });
     log.info("ingest: duplicate photo delivery skipped", { listingId });
   }
   await deps.saveConversation(igsid, {

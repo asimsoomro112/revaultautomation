@@ -222,6 +222,17 @@ export function coerceFieldValue(field: string, raw: string): CoercedValue {
   switch (field) {
     case "price_pkr": {
       if (/-\s*\d/.test(text)) return { ok: false }; // negatives are never valid prices
+      // "2k" / "1.5k" / "2k PKR" → thousands. Must run before the digit-strip
+      // below, which would read "2k" as 2 (2026-11-23: Nina's "Discounted
+      // price: 2k" would have become Rs 2).
+      const kMatch = /^([\d.,]+)\s*k\b/i.exec(text);
+      if (kMatch) {
+        const rawNum = kMatch[1];
+        if (!rawNum) return { ok: false };
+        const n = parseFloat(rawNum.replace(/,/g, ""));
+        if (Number.isNaN(n) || n <= 0 || n * 1000 > 100_000_000) return { ok: false };
+        return { ok: true, value: Math.round(n * 1000) };
+      }
       const digits = text.replace(/[^\d]/g, "");
       const n = parseInt(digits, 10);
       if (!digits || Number.isNaN(n) || n <= 0 || n > 100_000_000) return { ok: false };
@@ -313,6 +324,64 @@ export function blankExtracted(): ExtractedItem {
 }
 
 // ---------------------------------------------------------------------------
+// Pure: multi-field details dump parsing (NEEDS_INFO)
+// ---------------------------------------------------------------------------
+
+export interface ParsedDetail {
+  field: string;
+  rawValue: string;
+}
+
+/**
+ * Sellers answer a missing-field question with ONE multi-line dump
+ * ("Brand: …\nSize: …\nDiscounted price: 2k\nCity: …") instead of one field
+ * at a time. The old NEEDS_INFO path coerced the whole blob as the answer to
+ * the single pending field and threw the rest away (2026-11-23: Nina's dump
+ * arrived after finalize and was lost). Parse every recognizable "Key: value"
+ * line into a field; unknown keys (Dc, Shoulder…) are skipped.
+ */
+const DETAIL_KEY_TO_FIELD: Array<[RegExp, string]> = [
+  [/^discount(ed)?\s+price/i, "price_pkr"],
+  [/^(sale\s+price|price|qeemat|qimat|daam|rate)\b/i, "price_pkr"],
+  [/^original\s+price/i, "__original_price"],
+  [/^brand/i, "brand"],
+  [/^size/i, "size"],
+  [/^condition|halat/i, "condition"],
+  [/^city|sheher|shehr|location/i, "city"],
+  [/^measurements?|naap/i, "measurements"],
+  [/^length|width|chest|shoulder|sleeve|waist/i, "measurements"],
+  [/^categor(y|ies)|type|qisam/i, "category"],
+  [/^colou?r|rang/i, "color"],
+  [/^gender/i, "gender"],
+  [/^defects?|damage|kharabi/i, "defects"],
+];
+
+export function parseDetailsDump(text: string): ParsedDetail[] {
+  const out: ParsedDetail[] = [];
+  let originalPrice: ParsedDetail | null = null;
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^([^:]{1,30}?)\s*[:\-–]\s*(.+)$/.exec(line.trim());
+    if (!m) continue;
+    const key = (m[1] ?? "").trim();
+    const value = (m[2] ?? "").trim();
+    if (!key || !value) continue;
+    const hit = DETAIL_KEY_TO_FIELD.find(([re]) => re.test(key));
+    if (!hit) continue;
+    const field = hit[1];
+    if (field === "__original_price") {
+      originalPrice = { field: "price_pkr", rawValue: value };
+      continue;
+    }
+    if (out.some((d) => d.field === field)) continue; // first wins per field
+    out.push({ field, rawValue: value });
+  }
+  // The selling price is the discounted one; fall back to the original price
+  // only when no discounted/sale price was given.
+  if (!out.some((d) => d.field === "price_pkr") && originalPrice) out.push(originalPrice);
+  return out;
+}
+
+// ---------------------------------------------------------------------------
 // Deps port — db shape mirrors lib/db.ts (Phase 1); fakes in tests
 // ---------------------------------------------------------------------------
 
@@ -321,6 +390,21 @@ export interface DbPort {
   saveConversation(igsid: string, patch: Partial<ConversationDoc>): Promise<ConversationDoc>;
   getListing(id: string): Promise<ListingDoc | null>;
   saveListing(id: string, patch: Partial<ListingDoc>): Promise<void>;
+  /**
+   * Transactional read-modify-write (see lib/db.ts mutateListing). Any write
+   * whose new value derives from the current doc (chat_text, extracted,
+   * photos) MUST use this — a getListing + saveListing pair loses updates
+   * when burst messages process concurrently.
+   */
+  mutateListing: <T>(
+    id: string,
+    mutate: (doc: ListingDoc) => { patch: Partial<ListingDoc>; result: T },
+  ) => Promise<T>;
+  /**
+   * Transactional find-or-create of the sender's active DRAFT/NEEDS_INFO
+   * listing (see lib/db.ts getOrCreateActiveListing).
+   */
+  getOrCreateActiveListing: (igsid: string, nowIso: string) => Promise<{ listing: ListingDoc; isNew: boolean }>;
   createListing(doc: ListingDoc): Promise<void>;
   appendListingEvent(listingId: string, event: { type: string; at?: string; [k: string]: unknown }): Promise<void>;
   getAdminSettings(): Promise<AdminSettings>;
@@ -351,11 +435,6 @@ export interface Deps {
 /** Persist the mutated conversation doc (db API is patch-based). */
 async function persistConvo(deps: Deps, convo: ConversationDoc): Promise<void> {
   await deps.db.saveConversation(convo.igsid, { ...convo });
-}
-
-/** Persist the mutated listing doc (db API is patch-based). */
-async function persistListing(deps: Deps, listing: ListingDoc): Promise<void> {
-  await deps.db.saveListing(listing.id, { ...listing });
 }
 
 /**
@@ -411,9 +490,11 @@ export async function sendSafe(
 export async function moveToConfirm(deps: Deps, convo: ConversationDoc, listing: ListingDoc): Promise<void> {
   if (!listing.extracted) throw new Error("moveToConfirm: listing has no extracted data");
   const caption = await deps.buildCaption(listing.extracted, convo.lang);
+  // Narrow patch, not a full-doc save: a concurrent photo/chat append must
+  // never be clobbered by this status transition.
+  await deps.db.saveListing(listing.id, { caption, status: "CONFIRM" });
   listing.caption = caption;
   listing.status = "CONFIRM";
-  await persistListing(deps, listing);
   await deps.db.appendListingEvent(listing.id, { type: "confirm", caption_chars: caption.length });
   setConversationState(convo, "CONFIRM");
   await persistConvo(deps, convo);
@@ -444,6 +525,10 @@ function appendChat(existing: string, text: string): string {
  * Ensure the conversation has an active DRAFT-ish listing. Shared with the
  * ingest worker (Phase 1): call this when photos arrive with no active listing.
  * Returns { listing: null } when the seller hit the daily listing limit.
+ *
+ * Creation is transactional (getOrCreateActiveListing): two concurrent first
+ * messages must not each create their own listing and split one seller's
+ * photos across two listings.
  */
 export async function ensureActiveListing(
   deps: Deps,
@@ -459,14 +544,15 @@ export async function ensureActiveListing(
     convo.active_listing_id = null; // stale pointer (submitted/rejected/…)
   }
   if (convo.listings_today >= deps.maxListingsPerSellerPerDay) return { listing: null, isNew: false };
-  const listing = deps.db.blankListingDoc(deps.db.newListingId(), convo.igsid, nowIso);
-  await deps.db.createListing(listing);
+  const { listing, isNew } = await deps.db.getOrCreateActiveListing(convo.igsid, nowIso);
   convo.active_listing_id = listing.id;
   convo.intent = "SELLER_SUBMIT";
-  convo.listings_today += 1;
+  if (isNew) {
+    convo.listings_today += 1;
+    await deps.db.appendListingEvent(listing.id, { type: "created", source: "dm" });
+  }
   if (convo.state === "IDLE") setConversationState(convo, "COLLECTING");
-  await deps.db.appendListingEvent(listing.id, { type: "created", source: "dm" });
-  return { listing, isNew: true };
+  return { listing, isNew };
 }
 
 // ---------------------------------------------------------------------------
@@ -572,8 +658,12 @@ async function handleText(deps: Deps, convo: ConversationDoc, text: string, nowI
           await persistConvo(deps, convo);
           await sendSafe(deps, convo, { text: listingLimitReply(convo.lang, deps.maxListingsPerSellerPerDay) });
         } else {
-          ensured.listing.chat_text = appendChat(ensured.listing.chat_text, text);
-          await persistListing(deps, ensured.listing);
+          // Transactional append: a concurrent photo ingest must not lose
+          // this text, and this save must not clobber its photos.
+          await deps.db.mutateListing(ensured.listing.id, (doc) => ({
+            patch: { chat_text: appendChat(doc.chat_text ?? "", text) },
+            result: undefined,
+          }));
           await persistConvo(deps, convo);
           await sendSafe(deps, convo, { text: ensured.isNew ? sellerGreeting(convo.lang) : collectingAck(convo.lang) });
         }
@@ -596,8 +686,12 @@ async function handleText(deps: Deps, convo: ConversationDoc, text: string, nowI
         await sendSafe(deps, convo, { text: helpText(convo.lang) });
         break;
       }
-      listing.chat_text = appendChat(listing.chat_text, text);
-      await persistListing(deps, listing);
+      // Transactional append (see IDLE branch): burst photos + this text
+      // process concurrently, and neither may clobber the other.
+      await deps.db.mutateListing(listing.id, (doc) => ({
+        patch: { chat_text: appendChat(doc.chat_text ?? "", text) },
+        result: undefined,
+      }));
       await persistConvo(deps, convo);
       await sendSafe(deps, convo, { text: collectingAck(convo.lang) });
       break;
@@ -610,6 +704,11 @@ async function handleText(deps: Deps, convo: ConversationDoc, text: string, nowI
         await persistConvo(deps, convo);
         break;
       }
+      // A multi-line details dump answers several fields at once — parse
+      // every recognizable field out of it before falling back to the
+      // single pending-question answer.
+      const dump = parseDetailsDump(text);
+      if (dump.length > 0 && (await applyDetailsDump(deps, convo, listing, text, dump))) break;
       // Typed answer to the pending question. Quick-reply taps arrive as
       // quick_reply kind; typed text may match a numbered/word fallback.
       const pending = nextQuestion(readyForConfirm(listing).missing, convo.lang, listing.photos.length);
@@ -669,9 +768,11 @@ async function handleConsentPost(deps: Deps, convo: ConversationDoc, mid: string
   }
   const already = listing.status === "SUBMITTED";
   if (!already) {
-    listing.consent = { at: nowIso, message_id: mid };
+    const consent = { at: nowIso, message_id: mid };
+    // Narrow patch, not a full-doc save (see moveToConfirm).
+    await deps.db.saveListing(listing.id, { consent, status: "SUBMITTED" });
+    listing.consent = consent;
     listing.status = "SUBMITTED";
-    await persistListing(deps, listing);
     await deps.db.appendListingEvent(listing.id, { type: "consent", at: nowIso, message_id: mid });
     setConversationState(convo, "IDLE");
     convo.active_listing_id = null;
@@ -687,8 +788,9 @@ async function handleConsentPost(deps: Deps, convo: ConversationDoc, mid: string
 async function handleConsentCancel(deps: Deps, convo: ConversationDoc): Promise<void> {
   const listing = await activeListing(deps, convo);
   if (listing && (convo.state === "CONFIRM" || listing.status === "CONFIRM")) {
+    // Narrow patch, not a full-doc save (see moveToConfirm).
+    await deps.db.saveListing(listing.id, { status: "REJECTED" });
     listing.status = "REJECTED";
-    await persistListing(deps, listing);
     await deps.db.appendListingEvent(listing.id, { type: "cancelled_by_seller" });
   }
   setConversationState(convo, "IDLE");
@@ -705,7 +807,8 @@ async function handleConsentEdit(deps: Deps, convo: ConversationDoc): Promise<vo
   }
   listing.status = "NEEDS_INFO";
   listing.missing = ["caption"];
-  await persistListing(deps, listing);
+  // Narrow patch, not a full-doc save (see moveToConfirm).
+  await deps.db.saveListing(listing.id, { status: "NEEDS_INFO", missing: ["caption"] });
   setConversationState(convo, "NEEDS_INFO");
   await persistConvo(deps, convo);
   const q = nextQuestion(["caption"], convo.lang, listing.photos.length);
@@ -734,20 +837,71 @@ async function handleInfoAnswer(
     await sendSafe(deps, convo, sendOpts(clarifyRetry(convo.lang, q.question), q.quickReplies));
     return;
   }
-  applyFieldValue(listing, field, coerced.value);
-  listing.missing = listing.missing.filter((m) => m !== field);
-  listing.chat_text = appendChat(listing.chat_text, `[${field}] ${rawValue.trim()}`);
-  const after = readyForConfirm(listing);
+  // Apply to the FRESH doc inside the transaction: a concurrent photo ingest
+  // or second answer must not lose this field (or its photos).
+  const updated = await deps.db.mutateListing(listing.id, (doc) => {
+    normalizeListing(doc);
+    applyFieldValue(doc, field, coerced.value);
+    doc.missing = (doc.missing ?? []).filter((m) => m !== field);
+    doc.chat_text = appendChat(doc.chat_text ?? "", `[${field}] ${rawValue.trim()}`);
+    return {
+      patch: { extracted: doc.extracted, missing: doc.missing, chat_text: doc.chat_text, caption: doc.caption },
+      result: doc,
+    };
+  });
+  const after = readyForConfirm(updated);
   if (after.ok) {
-    await moveToConfirm(deps, convo, listing);
+    await moveToConfirm(deps, convo, updated);
   } else {
-    listing.status = "NEEDS_INFO";
-    await persistListing(deps, listing);
+    await deps.db.saveListing(listing.id, { status: "NEEDS_INFO", missing: after.missing });
     setConversationState(convo, "NEEDS_INFO");
     await persistConvo(deps, convo);
-    const q = nextQuestion(after.missing, convo.lang, listing.photos.length);
+    const q = nextQuestion(after.missing, convo.lang, updated.photos.length);
     await sendSafe(deps, convo, sendOpts(q.question, q.quickReplies));
   }
+}
+
+/**
+ * Apply a parsed multi-field dump (see parseDetailsDump) to the listing.
+ * Returns false when nothing in the dump coerces (caller falls back to the
+ * single-field answer path); otherwise moves the conversation on (CONFIRM
+ * when complete, next question when fields are still missing).
+ */
+async function applyDetailsDump(
+  deps: Deps,
+  convo: ConversationDoc,
+  listing: ListingDoc,
+  rawText: string,
+  dump: ParsedDetail[],
+): Promise<boolean> {
+  const coerced: Array<{ field: string; value: string | number }> = [];
+  for (const d of dump) {
+    const c = coerceFieldValue(d.field, d.rawValue);
+    if (c.ok) coerced.push({ field: d.field, value: c.value });
+  }
+  if (coerced.length === 0) return false;
+  const updated = await deps.db.mutateListing(listing.id, (doc) => {
+    normalizeListing(doc);
+    for (const { field, value } of coerced) applyFieldValue(doc, field, value);
+    const applied = coerced.map((x) => x.field);
+    doc.missing = (doc.missing ?? []).filter((m) => !applied.includes(m));
+    doc.chat_text = appendChat(doc.chat_text ?? "", rawText.trim());
+    return {
+      patch: { extracted: doc.extracted, missing: doc.missing, chat_text: doc.chat_text, caption: doc.caption },
+      result: doc,
+    };
+  });
+  const after = readyForConfirm(updated);
+  if (after.ok) {
+    await moveToConfirm(deps, convo, updated);
+  } else {
+    await deps.db.saveListing(listing.id, { status: "NEEDS_INFO", missing: after.missing });
+    setConversationState(convo, "NEEDS_INFO");
+    await persistConvo(deps, convo);
+    const q = nextQuestion(after.missing, convo.lang, updated.photos.length);
+    await sendSafe(deps, convo, sendOpts(q.question, q.quickReplies));
+  }
+  return true;
 }
 
 /** Build SendMessageOpts without passing explicit `undefined` quickReplies (exactOptionalPropertyTypes). */

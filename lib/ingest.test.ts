@@ -5,6 +5,7 @@
 import { describe, expect, it } from "vitest";
 import { processIngest, type EnqueueFn, type IngestDeps } from "./ingest";
 import { blankListingDoc } from "./db";
+import { blankTestConversation, makeKeyedMutex } from "./test-fakes";
 import type {
   ConversationDoc,
   ListingDoc,
@@ -38,69 +39,78 @@ function makeInbound(kind: NormalizedInbound["kind"], mid: string, extra: Partia
   };
 }
 
-function makeDeps(): { deps: IngestDeps; enqueued: Enqueued[]; downloads: { url: string; dest: string }[] } {
+function makeDeps(): {
+  deps: IngestDeps;
+  enqueued: Enqueued[];
+  downloads: { url: string; dest: string }[];
+  listings: Map<string, ListingDoc>;
+  convs: Map<string, ConversationDoc>;
+} {
   const listings = new Map<string, ListingDoc>();
   const convs = new Map<string, ConversationDoc>();
   const enqueued: Enqueued[] = [];
   const downloads: { url: string; dest: string }[] = [];
+  let idSeq = 0;
+  // Same serialization the real Firestore transactions provide, so burst
+  // tests exercise the same interleaving production sees.
+  const locks = makeKeyedMutex();
 
   const deps: IngestDeps = {
     downloadImage: async (url, dest) => {
       downloads.push({ url, dest });
       return { bytes: 4242 };
     },
-    getOrCreateConversation: async (igsid) => {
-      const existing = convs.get(igsid);
-      if (existing) return existing;
-      const doc: ConversationDoc = {
-        igsid,
-        state: "IDLE",
-        lang: "roman",
-        active_listing_id: null,
-        intent: null,
-        listings_today: 0,
-        listings_day: "2026-09-30",
-        last_user_msg_at: null,
-        window_open: false,
-        human_needed: false,
-        blocked: false,
-        msg_count_1h: 0,
-        msg_window_start: null,
-        user_msg_total: 0,
-        last_processed_mid: null,
-      };
-      convs.set(igsid, doc);
-      return doc;
-    },
     saveConversation: async (igsid, patch) => {
-      const cur = convs.get(igsid) ?? (await deps.getOrCreateConversation(igsid));
+      const cur = convs.get(igsid) ?? blankTestConversation(igsid);
       const next = { ...cur, ...patch, igsid };
       convs.set(igsid, next);
       return next;
     },
-    getListing: async (id) => listings.get(id) ?? null,
-    createListing: async (doc) => {
-      listings.set(doc.id, doc);
-    },
-    saveListing: async (id, patch) => {
-      const cur = listings.get(id);
-      if (!cur) throw new Error(`listing ${id} not found`);
-      listings.set(id, { ...cur, ...patch });
-    },
-    blankListingDoc,
-    newListingId: () => "lst_test123",
+    mutateListing: async (id, mutate) =>
+      locks(id, async () => {
+        const doc = listings.get(id);
+        if (!doc) throw new Error(`listing ${id} not found`);
+        // Firestore-style snapshot: the mutator works on a detached copy, so
+        // without the lock two concurrent mutates would lose each other's
+        // writes (the exact burst race this guards against).
+        const snap = structuredClone(doc);
+        const { patch, result } = mutate(snap);
+        Object.assign(doc, patch);
+        return result;
+      }),
+    getOrCreateActiveListing: async (igsid, nowIso) =>
+      locks(`conv:${igsid}`, async () => {
+        const convoSnap = convs.get(igsid);
+        const convo = convoSnap ? structuredClone(convoSnap) : null;
+        if (convo?.active_listing_id) {
+          const existing = listings.get(convo.active_listing_id);
+          if (existing && (existing.status === "DRAFT" || existing.status === "NEEDS_INFO")) {
+            return { listing: existing, isNew: false };
+          }
+        }
+        const id = ++idSeq === 1 ? "lst_test123" : `lst_test${idSeq}`;
+        const doc = blankListingDoc(id, igsid, nowIso);
+        listings.set(id, doc);
+        const c = convo ?? blankTestConversation(igsid);
+        c.active_listing_id = id;
+        c.state = "COLLECTING";
+        c.last_user_msg_at = nowIso;
+        c.window_open = true;
+        convs.set(igsid, c);
+        return { listing: doc, isNew: true };
+      }),
     enqueue: (async (route, payload, opts) => {
       enqueued.push({ route, payload, opts });
     }) as EnqueueFn,
     getPhotoDebounceSeconds: () => 25,
     nowIso: () => NOW,
   };
-  return { deps, enqueued, downloads };
+  return { deps, enqueued, downloads, listings, convs };
 }
 
 describe("processIngest — image", () => {
   it("creates a DRAFT listing, stores the photo, arms the debounce timer", async () => {
-    const { deps, enqueued, downloads } = makeDeps();
+    const { deps, enqueued, downloads, listings, convs } = makeDeps();
     const msg = makeInbound("image", "m_img1", { image_url: "https://cdn.example/a.jpg" });
 
     const res = await processIngest({ kind: "ingest", message: msg }, deps);
@@ -109,15 +119,15 @@ describe("processIngest — image", () => {
     expect(res.listingId).toBe("lst_test123");
     expect(downloads).toHaveLength(1);
     expect(downloads[0]?.dest).toBe("raw/lst_test123/m_img1.jpg");
-    const listing = await deps.getListing("lst_test123");
+    const listing = listings.get("lst_test123");
     expect(listing?.status).toBe("DRAFT");
     expect(listing?.photos).toHaveLength(1);
     expect(listing?.photos[0]?.storage_path).toBe("raw/lst_test123/m_img1.jpg");
     expect(listing?.last_photo_at).toBe(NOW);
-    const conv = await deps.getOrCreateConversation(IGSID);
-    expect(conv.state).toBe("COLLECTING");
-    expect(conv.active_listing_id).toBe("lst_test123");
-    expect(conv.window_open).toBe(true);
+    const conv = convs.get(IGSID);
+    expect(conv?.state).toBe("COLLECTING");
+    expect(conv?.active_listing_id).toBe("lst_test123");
+    expect(conv?.window_open).toBe(true);
 
     const finalize = enqueued.filter((e) => e.route === "finalize-photos");
     expect(finalize).toHaveLength(1);
@@ -131,7 +141,7 @@ describe("processIngest — image", () => {
   });
 
   it("reuses the sender's active DRAFT listing for a second photo", async () => {
-    const { deps, enqueued } = makeDeps();
+    const { deps, enqueued, listings } = makeDeps();
     await processIngest(
       { kind: "ingest", message: makeInbound("image", "m_img1", { image_url: "https://cdn.example/a.jpg" }) },
       deps,
@@ -142,40 +152,86 @@ describe("processIngest — image", () => {
       { kind: "ingest", message: makeInbound("image", "m_img2", { image_url: "https://cdn.example/b.jpg" }) },
       deps2,
     );
-    const listing = await deps.getListing("lst_test123");
+    const listing = listings.get("lst_test123");
     expect(listing?.photos).toHaveLength(2);
     expect(listing?.photos[1]?.storage_path).toBe("raw/lst_test123/m_img2.jpg");
     // Two debounce timers armed — the older one self-skips on photo_at mismatch.
     expect(enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(2);
   });
 
+  it("burst of 3 concurrent photos all land in one listing (2026-11-23: Nina sent 3, only 1 survived)", async () => {
+    const { deps, listings } = makeDeps();
+    const at = (s: string) => ({ ...deps, nowIso: () => `2026-09-30T17:05:${s}.000Z` });
+    const results = await Promise.all([
+      processIngest(
+        { kind: "ingest", message: makeInbound("image", "m_b1", { image_url: "https://cdn.example/1.jpg" }) },
+        at("00"),
+      ),
+      processIngest(
+        { kind: "ingest", message: makeInbound("image", "m_b2", { image_url: "https://cdn.example/2.jpg" }) },
+        at("01"),
+      ),
+      processIngest(
+        { kind: "ingest", message: makeInbound("image", "m_b3", { image_url: "https://cdn.example/3.jpg" }) },
+        at("02"),
+      ),
+    ]);
+    // One listing, not three — the concurrent creates must not split the burst.
+    expect(listings.size).toBe(1);
+    expect(results.map((r) => r.listingId)).toEqual(["lst_test123", "lst_test123", "lst_test123"]);
+    const listing = listings.get("lst_test123");
+    expect(listing?.photos).toHaveLength(3);
+    expect(listing?.photos.map((p) => p.storage_path).sort()).toEqual([
+      "raw/lst_test123/m_b1.jpg",
+      "raw/lst_test123/m_b2.jpg",
+      "raw/lst_test123/m_b3.jpg",
+    ]);
+  });
+
   it("a duplicate delivery of the same photo (same mid) appends it only once", async () => {
-    const { deps, downloads } = makeDeps();
+    const { deps, downloads, listings } = makeDeps();
     const msg = makeInbound("image", "m_img1", { image_url: "https://cdn.example/a.jpg" });
     await processIngest({ kind: "ingest", message: msg }, deps);
     // QStash retries the whole ingest (same mid → same storage_path).
     await processIngest({ kind: "ingest", message: msg }, deps);
-    const listing = await deps.getListing("lst_test123");
+    const listing = listings.get("lst_test123");
     expect(listing?.photos).toHaveLength(1);
     expect(listing?.photos[0]?.storage_path).toBe("raw/lst_test123/m_img1.jpg");
     // The second delivery skips the download too (the CDN URL may be expired).
     expect(downloads).toHaveLength(1);
   });
 
-  it("starts a new listing when the active one is no longer DRAFT", async () => {
-    const { deps } = makeDeps();
+  it("appends a photo to the active NEEDS_INFO listing instead of starting a new one", async () => {
+    const { deps, listings } = makeDeps();
     await processIngest(
       { kind: "ingest", message: makeInbound("image", "m_img1", { image_url: "https://cdn.example/a.jpg" }) },
       deps,
     );
-    await deps.saveListing("lst_test123", { status: "NEEDS_INFO" });
-    let n = 0;
-    const deps2 = { ...deps, newListingId: () => `lst_new${++n}` };
+    // The bot asked for a missing photo; the seller's next photo belongs to
+    // the SAME listing (previously ingest only reused DRAFT and split it).
+    listings.get("lst_test123")!.status = "NEEDS_INFO";
     const res = await processIngest(
       { kind: "ingest", message: makeInbound("image", "m_img9", { image_url: "https://cdn.example/z.jpg" }) },
-      deps2,
+      { ...deps, nowIso: () => "2026-09-30T17:05:03.000Z" },
     );
-    expect(res.listingId).toBe("lst_new1");
+    expect(res.listingId).toBe("lst_test123");
+    expect(listings.get("lst_test123")?.photos).toHaveLength(2);
+    expect(listings.size).toBe(1);
+  });
+
+  it("starts a new listing when the active one is SUBMITTED", async () => {
+    const { deps, listings } = makeDeps();
+    await processIngest(
+      { kind: "ingest", message: makeInbound("image", "m_img1", { image_url: "https://cdn.example/a.jpg" }) },
+      deps,
+    );
+    listings.get("lst_test123")!.status = "SUBMITTED";
+    const res = await processIngest(
+      { kind: "ingest", message: makeInbound("image", "m_img9", { image_url: "https://cdn.example/z.jpg" }) },
+      { ...deps, nowIso: () => "2026-09-30T17:05:03.000Z" },
+    );
+    expect(res.listingId).toBe("lst_test2");
+    expect(listings.size).toBe(2);
   });
 
   it("sanitizes mids with unsafe characters for the storage path", async () => {

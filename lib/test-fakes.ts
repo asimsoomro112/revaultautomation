@@ -20,7 +20,30 @@ import type {
   WorkerPayload,
 } from "./types";
 
-/** A minimal valid ListingPhoto for tests. */
+/**
+ * Serialize async work per key (models Firestore transaction serialization).
+ * Concurrent callers with the same key run one after another; different keys
+ * run in parallel. Used by the fake db's mutateListing /
+ * getOrCreateActiveListing so burst tests exercise the same serialization
+ * the real transactions provide.
+ */
+export function makeKeyedMutex(): <T>(key: string, fn: () => Promise<T>) => Promise<T> {
+  const chains = new Map<string, Promise<unknown>>();
+  return async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+    const prev = chains.get(key) ?? Promise.resolve();
+    let release!: () => void;
+    const cur = new Promise<void>((r) => {
+      release = r;
+    });
+    chains.set(key, prev.then(() => cur));
+    await prev;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  };
+}
 export function makePhoto(storagePath: string, at: string = NOW): ListingPhoto {
   return { storage_path: storagePath, w: 800, h: 1000, phash: "a".repeat(16), received_at: at };
 }
@@ -235,6 +258,7 @@ export function makeFakeDeps(overrides: Partial<FakeDb> = {}): FakeDeps {
   const enqueued: Enqueued[] = [];
   const downloads = new Map<string, Buffer>();
   let idSeq = 0;
+  const locks = makeKeyedMutex();
 
   const deps: FakeDeps = {
     fdb,
@@ -266,6 +290,36 @@ export function makeFakeDeps(overrides: Partial<FakeDb> = {}): FakeDeps {
         if (l) Object.assign(l, patch);
         else fdb.listings.set(id, patch as ListingDoc);
       },
+      mutateListing: async (id, mutate) =>
+        locks(id, async () => {
+          const doc = fdb.listings.get(id);
+          if (!doc) throw new Error(`mutateListing: listing ${id} not found`);
+          // Firestore-style snapshot: the mutator works on a detached copy.
+          const snap = structuredClone(doc);
+          const { patch, result } = mutate(snap);
+          Object.assign(doc, patch);
+          return result;
+        }),
+      getOrCreateActiveListing: async (igsid, nowIso) =>
+        locks(`conv:${igsid}`, async () => {
+          const convoSnap = fdb.convos.get(igsid);
+          const convo = convoSnap ? structuredClone(convoSnap) : null;
+          if (convo?.active_listing_id) {
+            const existing = fdb.listings.get(convo.active_listing_id);
+            if (existing && (existing.status === "DRAFT" || existing.status === "NEEDS_INFO")) {
+              return { listing: existing, isNew: false };
+            }
+          }
+          const doc = blankListingDoc(`lst_test_${++idSeq}`, igsid, nowIso);
+          fdb.listings.set(doc.id, doc);
+          const c = convo ?? blankTestConversation(igsid);
+          c.active_listing_id = doc.id;
+          c.state = "COLLECTING";
+          c.last_user_msg_at = nowIso;
+          c.window_open = true;
+          fdb.convos.set(igsid, c);
+          return { listing: doc, isNew: true };
+        }),
       createListing: async (doc: ListingDoc) => {
         fdb.listings.set(doc.id, doc);
       },

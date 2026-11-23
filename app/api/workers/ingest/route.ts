@@ -11,14 +11,10 @@ import { NextResponse } from "next/server";
 import { getEnv } from "@/lib/env";
 import { log } from "@/lib/log";
 import {
-  blankListingDoc,
-  createListing,
-  getListing,
-  getOrCreateConversation,
-  newListingId,
+  getOrCreateActiveListing,
+  mutateListing,
   saveConversation,
   saveInboundMessage,
-  saveListing,
 } from "@/lib/db";
 import { downloadImageToStorage } from "@/lib/storage";
 import { enqueueWorker, verifyQStashSignatureRaw } from "@/lib/qstash";
@@ -58,13 +54,9 @@ export async function POST(req: Request): Promise<Response> {
   try {
     const result = await processIngest(parsed.data, {
       downloadImage: downloadImageToStorage,
-      getOrCreateConversation,
       saveConversation,
-      getListing,
-      createListing,
-      saveListing,
-      blankListingDoc,
-      newListingId,
+      mutateListing,
+      getOrCreateActiveListing,
       enqueue: (route, payload, opts) => enqueueWorker(route, payload, opts),
       getPhotoDebounceSeconds: () => getEnv().PHOTO_DEBOUNCE_SECONDS,
       saveInbound: saveInboundMessage,

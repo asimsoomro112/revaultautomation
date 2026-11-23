@@ -52,7 +52,7 @@ Working rules for anyone (human or agent) touching this repo. Short on purpose.
 
 ```bash
 npm install
-npm test                    # vitest, 262 tests, fully mocked
+npm test                    # vitest, 317 tests, fully mocked
 npx tsc --noEmit            # strict typecheck
 npm run dev                 # next dev
 npm run replay -- --fixture multi-image-burst --verify   # scripts/replay-webhook.ts
@@ -97,6 +97,28 @@ Workflow: `.agents/workflows/verify.md` (lint → typecheck → test).
   Server Component — they render nothing, silently (2026-11-23: the
   dashboard home cards lost all icons). Keep shared icons/elements in a
   plain module with no `"use client"` — see `app/admin/components/navIcons.tsx`.
+
+## Burst race (2026-11-23 — Nina, lst_a5fa2b817b16)
+- A seller's burst (3 photos + video + 2 texts within seconds) runs as
+  concurrent QStash jobs. The old read-modify-write pattern (getListing →
+  append in memory → saveListing whole array) LOST updates: 3 photos → 1
+  survived, and a details text could be clobbered the same way.
+- RULE: any listing write whose new value derives from the current doc
+  (photos array, chat_text, extracted) MUST go through `mutateListing`
+  (Firestore transaction, lib/db.ts). Narrow merge patches of independent
+  fields (status, caption, moderation) are already atomic per-field.
+- Listing find-or-create is transactional too (`getOrCreateActiveListing`) —
+  concurrent first photos must not each create their own listing.
+- Photos arriving while NEEDS_INFO append to the SAME listing (ingest reuses
+  DRAFT or NEEDS_INFO).
+- A multi-line details dump ("Brand: …\nDiscounted price: 2k\n…") arriving in
+  NEEDS_INFO is parsed field-by-field (`parseDetailsDump`, lib/conversation.ts);
+  "2k" prices coerce to 2000, discounted price wins over original price.
+- Finalize retries transient failures (retryable GeminiError, download/network)
+  twice, 60s apart, before failing closed to NEEDS_REVIEW — a 503 spike must
+  not strand a listing with nothing extracted.
+- Tests: `npm test` is 317 tests (23 files); the burst test fails without the
+  transaction locks (verified by temporarily removing them).
 
 ## Claude audit fixes (2026-11-23)
 - **Test clock:** `sendSafe` (and any 24h-window check) must use the injected

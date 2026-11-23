@@ -10,6 +10,7 @@ vi.mock("./moderation", () => ({
 
 import { applyModeration } from "./moderation";
 import { handleFinalizePhotos } from "./finalize";
+import { GeminiError } from "./gemini";
 import {
   IGSID,
   NOW,
@@ -29,8 +30,10 @@ const mockApplyModeration = vi.mocked(applyModeration);
 let deps: FakeDeps;
 let fdeps: FinalizeDeps;
 
-function payload(listingId: string, photoAt: string): FinalizePhotosPayload {
-  return { kind: "finalize-photos", listing_id: listingId, photo_at: photoAt };
+function payload(listingId: string, photoAt: string, attempt?: number): FinalizePhotosPayload {
+  return attempt === undefined
+    ? { kind: "finalize-photos", listing_id: listingId, photo_at: photoAt }
+    : { kind: "finalize-photos", listing_id: listingId, photo_at: photoAt, attempt };
 }
 
 async function seedListing(status: "DRAFT" | "NEEDS_INFO" = "DRAFT") {
@@ -165,8 +168,8 @@ describe("handleFinalizePhotos: moderation branches", () => {
   });
 });
 
-describe("handleFinalizePhotos: error paths (fail closed)", () => {
-  it("Gemini failure → NEEDS_REVIEW + alert, never auto-pass", async () => {
+describe("handleFinalizePhotos: error paths (retry, then fail closed)", () => {
+  it("transient Gemini failure → delayed retry (attempt+1), NOT review yet", async () => {
     await seedListing();
     deps.gemini.extractListingImpl = async () => {
       throw new Error("503 overloaded");
@@ -174,16 +177,63 @@ describe("handleFinalizePhotos: error paths (fail closed)", () => {
 
     await handleFinalizePhotos(payload("lst_1", NOW), fdeps);
     const listing = deps.fdb.listings.get("lst_1")!;
+    expect(listing.status).toBe("DRAFT"); // not failed closed on the first spike
+    expect(deps.alerts).toHaveLength(0);
+    expect(deps.fdb.events.some((e) => e.event.type === "finalize_retry")).toBe(true);
+    const retry = deps.enqueued.find((e) => e.route === "finalize-photos");
+    expect(retry).toBeDefined();
+    expect(retry!.payload).toMatchObject({ kind: "finalize-photos", listing_id: "lst_1", attempt: 1 });
+    expect(retry!.opts?.delaySec).toBe(60);
+  });
+
+  it("retry succeeds on the second attempt → CONFIRM", async () => {
+    await seedListing();
+    let calls = 0;
+    deps.gemini.extractListingImpl = async () => {
+      calls++;
+      if (calls === 1) throw new Error("503 overloaded");
+      return makeVisionResult();
+    };
+
+    await handleFinalizePhotos(payload("lst_1", NOW), fdeps);
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("DRAFT");
+    await handleFinalizePhotos(payload("lst_1", NOW, 1), fdeps);
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("CONFIRM");
+    expect(calls).toBe(2);
+  });
+
+  it("retries exhausted (attempt 2) → NEEDS_REVIEW + alert, never auto-pass", async () => {
+    await seedListing();
+    deps.gemini.extractListingImpl = async () => {
+      throw new Error("503 overloaded");
+    };
+
+    await handleFinalizePhotos(payload("lst_1", NOW, 2), fdeps);
+    const listing = deps.fdb.listings.get("lst_1")!;
     expect(listing.status).toBe("NEEDS_REVIEW");
     expect(deps.alerts).toHaveLength(1);
     expect(deps.meta.sent).toHaveLength(1);
   });
 
-  it("photo download failure → NEEDS_REVIEW", async () => {
+  it("non-retryable Gemini error → fails closed at once, no retry", async () => {
+    await seedListing();
+    deps.gemini.extractListingImpl = async () => {
+      throw new GeminiError("extractListing: schema validation failed", false);
+    };
+
+    await handleFinalizePhotos(payload("lst_1", NOW), fdeps);
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("NEEDS_REVIEW");
+    expect(deps.enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(0);
+  });
+
+  it("photo download failure → delayed retry first, NEEDS_REVIEW once retries exhaust", async () => {
     await seedListing();
     deps.downloads.clear();
 
     await handleFinalizePhotos(payload("lst_1", NOW), fdeps);
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("DRAFT");
+    expect(deps.enqueued.find((e) => e.route === "finalize-photos")).toBeDefined();
+    await handleFinalizePhotos(payload("lst_1", NOW, 2), fdeps);
     expect(deps.fdb.listings.get("lst_1")!.status).toBe("NEEDS_REVIEW");
   });
 

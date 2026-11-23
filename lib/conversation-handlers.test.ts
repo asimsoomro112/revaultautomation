@@ -202,6 +202,63 @@ describe("handleMessage: NEEDS_INFO typed answers", () => {
     expect(deps.fdb.listings.get("lst_1")!.extracted!.price_pkr).toBe(3000);
     expect(deps.fdb.convos.get(IGSID)!.state).toBe("CONFIRM");
   });
+
+  it("multi-line details dump applies every field → CONFIRM (Nina, 2026-11-23)", async () => {
+    const convo = await deps.db.getOrCreateConversation(IGSID);
+    const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
+    listing.status = "NEEDS_INFO";
+    listing.extracted = { ...blankTestExtracted(), category: "jeans" };
+    listing.photos = [makePhoto("sellers/x/0.jpg"), makePhoto("sellers/x/1.jpg")];
+    listing.missing = ["size", "condition", "price_pkr", "city"];
+    await deps.db.createListing(listing);
+    convo.state = "NEEDS_INFO";
+    convo.active_listing_id = "lst_1";
+
+    const dump = [
+      "Brand: Tinnie Tots",
+      "Size: 5-6 years",
+      "Condition: 10/10",
+      "Original price: 3500",
+      "Discounted price: 2k",
+      "Dc: 250",
+      "City: Lahore",
+      "Measurements",
+      'Length: 25.5"',
+    ].join("\n");
+    await handleMessage(payload("mid_7"), makeInbound("text", "mid_7", { text: dump }), deps);
+
+    const updated = deps.fdb.listings.get("lst_1")!;
+    expect(updated.extracted!.brand).toBe("Tinnie Tots");
+    expect(updated.extracted!.size).toBe("5-6 YEARS");
+    expect(updated.extracted!.condition).toBe("like_new");
+    expect(updated.extracted!.price_pkr).toBe(2000);
+    expect(updated.extracted!.city).toBe("Lahore");
+    expect(updated.extracted!.measurements).toBe('25.5"');
+    expect(updated.status).toBe("CONFIRM");
+    expect(deps.fdb.convos.get(IGSID)!.state).toBe("CONFIRM");
+  });
+});
+
+describe("handleMessage: concurrent chat while COLLECTING", () => {
+  it("two texts arriving together both land in chat_text (no lost update)", async () => {
+    const convo = await deps.db.getOrCreateConversation(IGSID);
+    const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
+    listing.status = "DRAFT";
+    listing.photos = [makePhoto("sellers/x/0.jpg"), makePhoto("sellers/x/1.jpg")];
+    await deps.db.createListing(listing);
+    convo.state = "COLLECTING";
+    convo.active_listing_id = "lst_1";
+    convo.last_user_msg_at = NOW;
+
+    await Promise.all([
+      handleMessage(payload("mid_a"), makeInbound("text", "mid_a", { text: "pehli baat" }), deps),
+      handleMessage(payload("mid_b"), makeInbound("text", "mid_b", { text: "dusri baat" }), deps),
+    ]);
+    const updated = deps.fdb.listings.get("lst_1")!;
+    expect(updated.chat_text).toMatch(/pehli baat/);
+    expect(updated.chat_text).toMatch(/dusri baat/);
+    expect(updated.photos).toHaveLength(2);
+  });
 });
 
 describe("handleMessage: consent", () => {

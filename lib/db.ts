@@ -184,6 +184,84 @@ export async function saveListing(id: string, patch: DeepPartial<ListingDoc>): P
   await col("listings").doc(id).set(patch, { merge: true });
 }
 
+/**
+ * Atomically read-modify-write a listing inside a Firestore transaction.
+ *
+ * WHY: burst DMs (3 photos + text within seconds) run as concurrent QStash
+ * jobs. The old pattern — getListing → append in memory → saveListing whole
+ * array — loses updates: two jobs read the same photos array, each appends
+ * its own photo, last writer wins (2026-11-23: Nina sent 3 photos, only 1
+ * survived in lst_a5fa2b817b16). A transaction serializes the readers, so
+ * every append lands. The mutator receives the FRESH doc and returns the
+ * patch to apply plus any result the caller needs.
+ *
+ * RULE: any write whose new value derives from the current doc (photos
+ * array, chat_text, extracted) MUST go through here — never via a
+ * getListing + saveListing pair. Narrow merge patches of independent fields
+ * (status, caption, moderation) are already atomic per-field and may keep
+ * using saveListing.
+ */
+export async function mutateListing<T>(
+  id: string,
+  mutate: (doc: ListingDoc) => { patch: Partial<ListingDoc>; result: T },
+): Promise<T> {
+  const ref = col("listings").doc(id);
+  return db().runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) throw new Error(`mutateListing: listing ${id} not found`);
+    const doc = snap.data() as ListingDoc;
+    const { patch, result } = mutate(doc);
+    tx.set(ref, patch, { merge: true });
+    return result;
+  });
+}
+
+/**
+ * Atomically find the sender's active DRAFT/NEEDS_INFO listing or create one.
+ *
+ * WHY: same burst race as mutateListing — two concurrent first-photos both
+ * saw `active_listing_id === null` and each created its own listing, splitting
+ * one seller's photos across two listings. The transaction claims the pointer
+ * (or the fresh listing) exactly once. Returns the listing + whether it was
+ * just created (callers only bump listings_today on a real create).
+ */
+export async function getOrCreateActiveListing(
+  igsid: string,
+  nowIso: string,
+): Promise<{ listing: ListingDoc; isNew: boolean }> {
+  const convRef = col("conversations").doc(igsid);
+  const listingId = newListingId();
+  return db().runTransaction(async (tx) => {
+    const convSnap = await tx.get(convRef);
+    const convo = convSnap.exists ? (convSnap.data() as ConversationDoc) : null;
+    if (convo?.active_listing_id) {
+      const listingSnap = await tx.get(col("listings").doc(convo.active_listing_id));
+      const existing = listingSnap.exists ? (listingSnap.data() as ListingDoc) : null;
+      if (existing && (existing.status === "DRAFT" || existing.status === "NEEDS_INFO")) {
+        return { listing: existing, isNew: false };
+      }
+    }
+    const doc = blankListingDoc(listingId, igsid, nowIso);
+    tx.set(col("listings").doc(listingId), doc);
+    if (convo) {
+      tx.set(
+        convRef,
+        { active_listing_id: listingId, state: "COLLECTING", last_user_msg_at: nowIso, window_open: true },
+        { merge: true },
+      );
+    } else {
+      tx.set(convRef, {
+        ...blankConversation(igsid),
+        state: "COLLECTING",
+        active_listing_id: listingId,
+        last_user_msg_at: nowIso,
+        window_open: true,
+      });
+    }
+    return { listing: doc, isNew: true };
+  });
+}
+
 /** Append to a listing's audit trail (listings/{id}/events/{autoId}). */
 export async function appendListingEvent(
   listingId: string,

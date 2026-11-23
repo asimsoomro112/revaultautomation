@@ -187,6 +187,13 @@ export interface FinalizePhotosPayload {
   kind: "finalize-photos";
   listing_id: string;
   photo_at: string; // ISO of the photo that armed the timer; skip if last_photo_at differs
+  /**
+   * Retry attempt (0-based). Absent on the first run. On a transient failure
+   * finalize re-enqueues itself with attempt+1 (max 2) instead of failing
+   * closed at once — a Gemini 503 spike must not strand a listing in review
+   * with nothing extracted (2026-11-23: Nina's listing, lst_a5fa2b817b16).
+   */
+  attempt?: number | undefined;
 }
 export interface PublishPayload {
   kind: "publish";
