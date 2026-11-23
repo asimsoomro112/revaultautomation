@@ -33,6 +33,7 @@ function makeListing(overrides: Partial<ListingDoc> = {}): ListingDoc {
       { storage_path: "raw/x/p1.jpg", w: 800, h: 1000, phash: PHASH_A, received_at: new Date().toISOString() },
     ],
     last_photo_at: null,
+    last_activity_at: null,
     extracted: null,
     missing: [],
     moderation: null,

@@ -30,16 +30,23 @@ const mockApplyModeration = vi.mocked(applyModeration);
 let deps: FakeDeps;
 let fdeps: FinalizeDeps;
 
-function payload(listingId: string, photoAt: string, attempt?: number): FinalizePhotosPayload {
-  return attempt === undefined
-    ? { kind: "finalize-photos", listing_id: listingId, photo_at: photoAt }
-    : { kind: "finalize-photos", listing_id: listingId, photo_at: photoAt, attempt };
+function payload(
+  listingId: string,
+  photoAt: string,
+  attempt?: number,
+  activityAt?: string,
+): FinalizePhotosPayload {
+  const p: FinalizePhotosPayload = { kind: "finalize-photos", listing_id: listingId, photo_at: photoAt };
+  if (attempt !== undefined) p.attempt = attempt;
+  if (activityAt !== undefined) p.activity_at = activityAt;
+  return p;
 }
 
 async function seedListing(status: "DRAFT" | "NEEDS_INFO" = "DRAFT") {
   const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
   listing.status = status;
   listing.last_photo_at = NOW;
+  listing.last_activity_at = NOW;
   listing.chat_text = "zara blazer bechna hai";
   listing.photos = [
     makePhoto("sellers/x/0.jpg"),
@@ -83,11 +90,110 @@ describe("handleFinalizePhotos: guards", () => {
     expect(deps.meta.sent).toHaveLength(0);
   });
 
+  it("skips when a details text re-armed the timer (activity moved on)", async () => {
+    await seedListing();
+    const listing = deps.fdb.listings.get("lst_1")!;
+    listing.last_activity_at = "2026-09-30T17:06:00.000Z"; // text arrived after arming
+    const res = await handleFinalizePhotos(payload("lst_1", NOW, undefined, NOW), fdeps);
+    expect(res).toEqual({ ok: true, skipped: "rearmed" });
+    expect(deps.meta.sent).toHaveLength(0);
+  });
+
+  it("skips when the listing has no photos (never fail closed on empty buffers)", async () => {
+    await seedListing();
+    const listing = deps.fdb.listings.get("lst_1")!;
+    listing.photos = [];
+    deps.gemini.extractListingImpl = async () => {
+      throw new Error("extractListing must not run with no photos");
+    };
+    const res = await handleFinalizePhotos(payload("lst_1", NOW, undefined, NOW), fdeps);
+    expect(res).toEqual({ ok: true, skipped: "no_photos" });
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("DRAFT");
+    expect(deps.meta.sent).toHaveLength(0);
+  });
+
   it("skips when the listing already left the processable states", async () => {
     await seedListing();
     deps.fdb.listings.get("lst_1")!.status = "SUBMITTED";
     const res = await handleFinalizePhotos(payload("lst_1", NOW), fdeps);
     expect(res).toEqual({ ok: true, skipped: "status" });
+  });
+});
+
+describe("handleFinalizePhotos: burst-combine — activity during extraction", () => {
+  const LATE = "2026-09-30T17:06:00.000Z";
+
+  it("discards the extraction and re-arms when a text lands mid-extraction", async () => {
+    await seedListing();
+    deps.gemini.extractListingImpl = async () => {
+      // A details text arrives while Gemini is thinking — the burst is not settled.
+      await deps.db.mutateListing("lst_1", (doc) => ({
+        patch: { chat_text: `${doc.chat_text ?? ""}\nBrand: Late Brand`, last_activity_at: LATE },
+        result: undefined,
+      }));
+      return makeVisionResult();
+    };
+    const res = await handleFinalizePhotos(payload("lst_1", NOW, undefined, NOW), fdeps);
+    expect(res).toEqual({ ok: true, skipped: "rearmed" });
+    // Nothing from the stale extraction was saved or branched on.
+    const listing = deps.fdb.listings.get("lst_1")!;
+    expect(listing.extracted).toBeNull();
+    expect(listing.status).toBe("DRAFT");
+    expect(deps.fdb.events.some((e) => e.event.type === "finalized")).toBe(false);
+    expect(deps.fdb.events.some((e) => e.event.type === "finalize_rearmed")).toBe(true);
+    const rearmed = deps.enqueued.filter((e) => e.route === "finalize-photos");
+    expect(rearmed).toHaveLength(1);
+    expect(rearmed[0]?.opts?.delaySec).toBe(25);
+    expect(rearmed[0]?.payload).toMatchObject({
+      kind: "finalize-photos",
+      listing_id: "lst_1",
+      photo_at: NOW,
+      activity_at: LATE,
+      rearm: 1,
+    });
+  });
+
+  it("proceeds after the re-arm cap instead of looping forever", async () => {
+    await seedListing();
+    deps.gemini.extractListingImpl = async () => {
+      await deps.db.mutateListing("lst_1", (_doc) => ({
+        patch: { last_activity_at: LATE },
+        result: undefined,
+      }));
+      return makeVisionResult();
+    };
+    const res = await handleFinalizePhotos(
+      { kind: "finalize-photos", listing_id: "lst_1", photo_at: NOW, activity_at: NOW, rearm: 4 },
+      fdeps,
+    );
+    expect(res).toEqual({ ok: true });
+    const listing = deps.fdb.listings.get("lst_1")!;
+    expect(listing.extracted).not.toBeNull();
+    expect(listing.status).toBe("CONFIRM"); // makeVisionResult is a complete extraction
+    expect(deps.enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(0);
+  });
+
+  it("a transient-failure retry preserves activity_at and rearm", async () => {
+    await seedListing();
+    deps.gemini.extractListingImpl = async () => {
+      throw new GeminiError("extractListing: boom", true);
+    };
+    const res = await handleFinalizePhotos(
+      { kind: "finalize-photos", listing_id: "lst_1", photo_at: NOW, activity_at: NOW, rearm: 1 },
+      fdeps,
+    );
+    expect(res).toEqual({ ok: true });
+    const retry = deps.enqueued.find((e) => e.route === "finalize-photos");
+    expect(retry).toBeDefined();
+    expect(retry!.payload).toMatchObject({
+      kind: "finalize-photos",
+      listing_id: "lst_1",
+      photo_at: NOW,
+      activity_at: NOW,
+      attempt: 1,
+      rearm: 1,
+    });
+    expect(retry!.opts?.delaySec).toBe(60);
   });
 });
 

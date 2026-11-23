@@ -261,6 +261,58 @@ describe("handleMessage: concurrent chat while COLLECTING", () => {
   });
 });
 
+describe("handleMessage: burst-combine — a details text re-arms finalize", () => {
+  async function seedCollectingWithPhotos() {
+    const convo = await deps.db.getOrCreateConversation(IGSID);
+    const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
+    listing.status = "DRAFT";
+    listing.photos = [makePhoto("sellers/x/0.jpg"), makePhoto("sellers/x/1.jpg")];
+    listing.last_photo_at = NOW;
+    listing.last_activity_at = NOW;
+    await deps.db.createListing(listing);
+    convo.state = "COLLECTING";
+    convo.active_listing_id = "lst_1";
+    convo.last_user_msg_at = NOW;
+    return listing;
+  }
+
+  it("text on a listing with photos re-arms finalize with a fresh activity_at", async () => {
+    await seedCollectingWithPhotos();
+    await handleMessage(
+      payload("mid_t"),
+      makeInbound("text", "mid_t", { text: "Brand: Test Brand\nSize: M\nDiscounted price: 2k" }),
+      deps,
+    );
+    const updated = deps.fdb.listings.get("lst_1")!;
+    expect(updated.chat_text).toMatch(/Test Brand/);
+    expect(updated.last_activity_at).toBe(NOW);
+    const finalize = deps.enqueued.filter((e) => e.route === "finalize-photos");
+    expect(finalize).toHaveLength(1);
+    expect(finalize[0]?.opts?.delaySec).toBe(25);
+    expect(finalize[0]?.payload).toMatchObject({
+      kind: "finalize-photos",
+      listing_id: "lst_1",
+      photo_at: NOW,
+      activity_at: NOW,
+    });
+  });
+
+  it("text on a listing with no photos does NOT arm finalize", async () => {
+    const convo = await deps.db.getOrCreateConversation(IGSID);
+    const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
+    listing.status = "DRAFT";
+    listing.photos = [];
+    await deps.db.createListing(listing);
+    convo.state = "COLLECTING";
+    convo.active_listing_id = "lst_1";
+    convo.last_user_msg_at = NOW;
+    await handleMessage(payload("mid_t"), makeInbound("text", "mid_t", { text: "hello, bechni hai" }), deps);
+    const updated = deps.fdb.listings.get("lst_1")!;
+    expect(updated.chat_text).toMatch(/hello, bechni hai/);
+    expect(deps.enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(0);
+  });
+});
+
 describe("handleMessage: consent", () => {
   async function seedConfirm() {
     const convo = await deps.db.getOrCreateConversation(IGSID);

@@ -52,7 +52,7 @@ Working rules for anyone (human or agent) touching this repo. Short on purpose.
 
 ```bash
 npm install
-npm test                    # vitest, 317 tests, fully mocked
+npm test                    # vitest, 326 tests, fully mocked
 npx tsc --noEmit            # strict typecheck
 npm run dev                 # next dev
 npm run replay -- --fixture multi-image-burst --verify   # scripts/replay-webhook.ts
@@ -117,8 +117,29 @@ Workflow: `.agents/workflows/verify.md` (lint → typecheck → test).
 - Finalize retries transient failures (retryable GeminiError, download/network)
   twice, 60s apart, before failing closed to NEEDS_REVIEW — a 503 spike must
   not strand a listing with nothing extracted.
-- Tests: `npm test` is 317 tests (23 files); the burst test fails without the
+- Tests: `npm test` is 326 tests (23 files); the burst test fails without the
   transaction locks (verified by temporarily removing them).
+
+## Burst combine (2026-11-23 — live test, lst_84dd9f3355b3)
+- The transaction fix shipped, but the live test (3 photos + details text)
+  still landed as 1 photo, no extracted fields, NEEDS_REVIEW. Diagnosis:
+  extraction ran on the photos alone — the details text arrived after the
+  photos (and possibly mid-extraction) and was never combined into it; a
+  finalize on an empty photo list used to fail closed ("no image buffers",
+  non-retryable) instead of skipping.
+- RULE: the bot now treats a seller's burst as ONE submission.
+  `last_activity_at` (ListingDoc) is bumped by every photo append AND every
+  text/dump/answer mutate. A text on a listing with photos re-arms
+  finalize-photos with a fresh `activity_at` (see `rearmFinalizeForText`,
+  lib/conversation.ts). Finalize skips when `activity_at` moved on, skips
+  when the listing has no photos, and re-checks activity AFTER extraction —
+  if anything arrived during the vision call, the result is discarded and
+  finalize re-arms (max 4 re-arms, then it proceeds).
+- A failed CDN download re-enqueues the ingest itself (attempt+1, 30s, max
+  2 — `IngestPayload.attempt`), so a transient failure cannot silently lose
+  a burst photo. The append stays idempotent on storage_path.
+- Tests: the burst-combine tests fail without the activity guards (re-check
+  discard, re-arm cap, no-photos skip, download self-retry).
 
 ## Claude audit fixes (2026-11-23)
 - **Test clock:** `sendSafe` (and any 24h-window check) must use the injected

@@ -37,6 +37,14 @@ export interface FinalizeDeps extends Deps {
 const FINALIZE_MAX_RETRIES = 2;
 const FINALIZE_RETRY_DELAY_SEC = 60;
 
+/**
+ * Re-arms of one finalize by activity arriving during extraction (see the
+ * post-extraction re-check). After this many, the run proceeds with the data
+ * it extracted rather than looping — a burst is finite, so this is a safety
+ * cap, not a path a human seller can hit.
+ */
+const FINALIZE_MAX_REARMS = 4;
+
 const PROCESSABLE = new Set(["DRAFT", "NEEDS_INFO"]);
 
 async function markNeedsReview(
@@ -64,7 +72,7 @@ export async function handleFinalizePhotos(
   payload: FinalizePhotosPayload,
   deps: FinalizeDeps,
 ): Promise<{ ok: true; skipped?: string }> {
-  const listing = await deps.db.getListing(payload.listing_id);
+  let listing = await deps.db.getListing(payload.listing_id);
   if (!listing) {
     log.warn("finalize.listing_missing", { listing_id: payload.listing_id });
     return { ok: true, skipped: "listing_missing" };
@@ -73,6 +81,21 @@ export async function handleFinalizePhotos(
   if (listing.last_photo_at !== payload.photo_at) {
     log.info("finalize.skipped_rearmed", { listing_id: listing.id });
     return { ok: true, skipped: "rearmed" };
+  }
+  // Burst-combine guard: a details text (or another photo) arrived after
+  // this run was armed — the newer finalize owns the burst, this one is stale.
+  if (payload.activity_at !== undefined && listing.last_activity_at !== payload.activity_at) {
+    log.info("finalize.skipped_rearmed_activity", { listing_id: listing.id });
+    return { ok: true, skipped: "rearmed" };
+  }
+  // A finalize with no photos to look at cannot extract anything — the old
+  // code let it reach extractListing, whose "no image buffers" error is
+  // non-retryable and failed the listing closed to review with nothing
+  // extracted (2026-11-23: lst_84dd9f3355b3). Skip instead: the photo's own
+  // finalize (or a later one) owns the burst.
+  if (listing.photos.length === 0) {
+    log.info("finalize.skipped_no_photos", { listing_id: listing.id });
+    return { ok: true, skipped: "no_photos" };
   }
   if (!PROCESSABLE.has(listing.status)) {
     log.info("finalize.skipped_status", { listing_id: listing.id, status: listing.status });
@@ -117,6 +140,44 @@ export async function handleFinalizePhotos(
 
     // 2. ONE Gemini vision call: extraction + moderation.
     const vision = await deps.gemini.extractListing(buffers, listing.chat_text ?? "", convo.lang);
+    // Burst-combine re-check: a photo or details text may have arrived
+    // DURING the vision call. Saving this extraction would drop it — the
+    // listing would show the old photos/text only (2026-11-23: the text
+    // landed mid-extraction and never made it into `extracted`). Discard
+    // and re-arm instead; the fresh run extracts the complete burst.
+    const expectedActivity = payload.activity_at ?? payload.photo_at;
+    const fresh = await deps.db.getListing(payload.listing_id);
+    const moved =
+      fresh !== null && fresh.last_activity_at !== null && fresh.last_activity_at !== expectedActivity;
+    if (moved && (payload.rearm ?? 0) < FINALIZE_MAX_REARMS) {
+      const rearm = (payload.rearm ?? 0) + 1;
+      log.info("finalize.rearmed_by_activity", { listing_id: listing.id, rearm });
+      await deps.db.appendListingEvent(listing.id, {
+        type: "finalize_rearmed",
+        rearm,
+        activity_at: fresh.last_activity_at,
+      });
+      await deps.enqueueWorker(
+        "finalize-photos",
+        {
+          kind: "finalize-photos",
+          listing_id: listing.id,
+          photo_at: fresh.last_photo_at ?? payload.photo_at,
+          activity_at: fresh.last_activity_at ?? expectedActivity,
+          attempt: payload.attempt,
+          rearm,
+        },
+        {
+          delaySec: deps.photoDebounceSeconds,
+          deduplicationId: `finalize-${listing.id}-${fresh.last_activity_at ?? expectedActivity}`,
+        },
+      );
+      return { ok: true, skipped: "rearmed" };
+    }
+    // Quiet (or re-arm cap hit): this extraction covers the whole burst.
+    // Branch on the fresh read so the photos/chat_text moderation sees are
+    // the current ones, not the snapshot from before the vision call.
+    if (fresh) listing = fresh;
     listing.extracted = vision.extracted;
     listing.missing = vision.missing;
     // Narrow patch, not a full-doc save (see markNeedsReview).
@@ -210,7 +271,9 @@ export async function handleFinalizePhotos(
           kind: "finalize-photos",
           listing_id: listing.id,
           photo_at: payload.photo_at,
+          activity_at: payload.activity_at,
           attempt: attempt + 1,
+          rearm: payload.rearm,
         },
         { delaySec: FINALIZE_RETRY_DELAY_SEC },
       );

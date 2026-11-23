@@ -430,6 +430,8 @@ export interface Deps {
   buildCaption: (extracted: ExtractedItem, lang: Lang) => Promise<string>;
   now: () => string;
   maxListingsPerSellerPerDay: number;
+  /** Seconds finalize-photos waits after the last burst activity (env PHOTO_DEBOUNCE_SECONDS). */
+  photoDebounceSeconds: number;
 }
 
 /** Persist the mutated conversation doc (db API is patch-based). */
@@ -451,6 +453,7 @@ function normalizeListing(listing: ListingDoc): void {
   if (listing.chat_text === undefined) listing.chat_text = "";
   if (!Array.isArray(listing.missing)) listing.missing = [];
   if (!Array.isArray(listing.photos)) listing.photos = [];
+  if (listing.last_activity_at === undefined) listing.last_activity_at = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -519,6 +522,32 @@ async function activeListing(deps: Deps, convo: ConversationDoc): Promise<Listin
 function appendChat(existing: string, text: string): string {
   const next = existing ? `${existing}\n${text}` : text;
   return next.length > 4000 ? next.slice(next.length - 4000) : next;
+}
+
+/**
+ * Burst-combine: a details text arriving on a listing that already has
+ * photos re-arms the finalize timer, so extraction waits for the whole
+ * burst (photos + text) instead of running on the photos alone — 2026-11-23
+ * the seller's text arrived after the photos and finalize extracted without
+ * it. No photos yet → nothing to finalize; the photo's own ingest arms it.
+ * The caller already bumped last_activity_at in the same mutate, so a
+ * finalize that started before this text skips itself on the activity guard.
+ */
+async function rearmFinalizeForText(deps: Deps, listing: ListingDoc, nowIso: string): Promise<void> {
+  if (listing.photos.length === 0) return;
+  await deps.enqueueWorker(
+    "finalize-photos",
+    {
+      kind: "finalize-photos",
+      listing_id: listing.id,
+      photo_at: listing.last_photo_at ?? nowIso,
+      activity_at: nowIso,
+    },
+    {
+      delaySec: deps.photoDebounceSeconds,
+      deduplicationId: `finalize-${listing.id}-${nowIso}`,
+    },
+  );
 }
 
 /**
@@ -659,11 +688,14 @@ async function handleText(deps: Deps, convo: ConversationDoc, text: string, nowI
           await sendSafe(deps, convo, { text: listingLimitReply(convo.lang, deps.maxListingsPerSellerPerDay) });
         } else {
           // Transactional append: a concurrent photo ingest must not lose
-          // this text, and this save must not clobber its photos.
+          // this text, and this save must not clobber its photos. The
+          // activity bump + finalize re-arm are the burst-combine: a text
+          // arriving before/after the photos joins the same extraction.
           await deps.db.mutateListing(ensured.listing.id, (doc) => ({
-            patch: { chat_text: appendChat(doc.chat_text ?? "", text) },
+            patch: { chat_text: appendChat(doc.chat_text ?? "", text), last_activity_at: nowIso },
             result: undefined,
           }));
+          await rearmFinalizeForText(deps, ensured.listing, nowIso);
           await persistConvo(deps, convo);
           await sendSafe(deps, convo, { text: ensured.isNew ? sellerGreeting(convo.lang) : collectingAck(convo.lang) });
         }
@@ -687,11 +719,14 @@ async function handleText(deps: Deps, convo: ConversationDoc, text: string, nowI
         break;
       }
       // Transactional append (see IDLE branch): burst photos + this text
-      // process concurrently, and neither may clobber the other.
+      // process concurrently, and neither may clobber the other. The
+      // activity bump + finalize re-arm are the burst-combine: this text
+      // joins the pending extraction instead of arriving too late for it.
       await deps.db.mutateListing(listing.id, (doc) => ({
-        patch: { chat_text: appendChat(doc.chat_text ?? "", text) },
+        patch: { chat_text: appendChat(doc.chat_text ?? "", text), last_activity_at: nowIso },
         result: undefined,
       }));
+      await rearmFinalizeForText(deps, listing, nowIso);
       await persistConvo(deps, convo);
       await sendSafe(deps, convo, { text: collectingAck(convo.lang) });
       break;
@@ -838,14 +873,16 @@ async function handleInfoAnswer(
     return;
   }
   // Apply to the FRESH doc inside the transaction: a concurrent photo ingest
-  // or second answer must not lose this field (or its photos).
+  // or second answer must not lose this field (or its photos). The activity
+  // bump tells a concurrently-running finalize its extraction is stale.
+  const nowIso = deps.now();
   const updated = await deps.db.mutateListing(listing.id, (doc) => {
     normalizeListing(doc);
     applyFieldValue(doc, field, coerced.value);
     doc.missing = (doc.missing ?? []).filter((m) => m !== field);
     doc.chat_text = appendChat(doc.chat_text ?? "", `[${field}] ${rawValue.trim()}`);
     return {
-      patch: { extracted: doc.extracted, missing: doc.missing, chat_text: doc.chat_text, caption: doc.caption },
+      patch: { extracted: doc.extracted, missing: doc.missing, chat_text: doc.chat_text, caption: doc.caption, last_activity_at: nowIso },
       result: doc,
     };
   });
@@ -880,6 +917,9 @@ async function applyDetailsDump(
     if (c.ok) coerced.push({ field: d.field, value: c.value });
   }
   if (coerced.length === 0) return false;
+  // The activity bump tells a concurrently-running finalize its extraction
+  // is stale (same reason as handleInfoAnswer above).
+  const nowIso = deps.now();
   const updated = await deps.db.mutateListing(listing.id, (doc) => {
     normalizeListing(doc);
     for (const { field, value } of coerced) applyFieldValue(doc, field, value);
@@ -887,7 +927,7 @@ async function applyDetailsDump(
     doc.missing = (doc.missing ?? []).filter((m) => !applied.includes(m));
     doc.chat_text = appendChat(doc.chat_text ?? "", rawText.trim());
     return {
-      patch: { extracted: doc.extracted, missing: doc.missing, chat_text: doc.chat_text, caption: doc.caption },
+      patch: { extracted: doc.extracted, missing: doc.missing, chat_text: doc.chat_text, caption: doc.caption, last_activity_at: nowIso },
       result: doc,
     };
   });

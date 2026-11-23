@@ -124,6 +124,7 @@ describe("processIngest — image", () => {
     expect(listing?.photos).toHaveLength(1);
     expect(listing?.photos[0]?.storage_path).toBe("raw/lst_test123/m_img1.jpg");
     expect(listing?.last_photo_at).toBe(NOW);
+    expect(listing?.last_activity_at).toBe(NOW); // burst-combine: photo bumps activity too
     const conv = convs.get(IGSID);
     expect(conv?.state).toBe("COLLECTING");
     expect(conv?.active_listing_id).toBe("lst_test123");
@@ -137,6 +138,7 @@ describe("processIngest — image", () => {
     if (p?.kind === "finalize-photos") {
       expect(p.listing_id).toBe("lst_test123");
       expect(p.photo_at).toBe(NOW);
+      expect(p.activity_at).toBe(NOW); // burst-combine: finalize carries the activity instant
     }
   });
 
@@ -241,6 +243,48 @@ describe("processIngest — image", () => {
       deps,
     );
     expect(downloads[0]?.dest).toBe("raw/lst_test123/mid__cAAx_y_z.jpg");
+  });
+
+  it("a failed CDN download re-enqueues the ingest itself (bounded) instead of losing the photo", async () => {
+    const { deps, enqueued, downloads, listings } = makeDeps();
+    const msg = makeInbound("image", "m_img1", { image_url: "https://cdn.example/a.jpg" });
+    let calls = 0;
+    deps.downloadImage = async (url, dest) => {
+      calls += 1;
+      downloads.push({ url, dest });
+      if (calls === 1) throw new Error("image download failed: HTTP 500");
+      return { bytes: 4242 };
+    };
+
+    // First delivery: download fails → self-retry scheduled, photo not lost.
+    const res = await processIngest({ kind: "ingest", message: msg }, deps);
+    expect(res.action).toBe("photo-retry");
+    expect(listings.get("lst_test123")?.photos).toHaveLength(0);
+    expect(enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(0);
+    const retry = enqueued.filter((e) => e.route === "ingest");
+    expect(retry).toHaveLength(1);
+    expect(retry[0]?.opts?.delaySec).toBe(30);
+    expect(retry[0]?.opts?.deduplicationId).toBe("m_img1-retry-1");
+    const rp = retry[0]?.payload;
+    expect(rp?.kind).toBe("ingest");
+    if (rp?.kind === "ingest") expect(rp.attempt).toBe(1);
+
+    // The retry (attempt 1) downloads fine → photo saved, finalize armed.
+    const res2 = await processIngest({ kind: "ingest", message: msg, attempt: 1 }, deps);
+    expect(res2.action).toBe("photo-saved");
+    expect(listings.get("lst_test123")?.photos).toHaveLength(1);
+    expect(enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(1);
+  });
+
+  it("a download that keeps failing past the retry budget throws (route 500 → QStash retries)", async () => {
+    const { deps } = makeDeps();
+    const msg = makeInbound("image", "m_img1", { image_url: "https://cdn.example/a.jpg" });
+    deps.downloadImage = async () => {
+      throw new Error("image download failed: HTTP 500");
+    };
+    await expect(processIngest({ kind: "ingest", message: msg, attempt: 2 }, deps)).rejects.toThrow(
+      "image download failed",
+    );
   });
 
   it("hands an image without image_url to the message worker (never crashes)", async () => {

@@ -150,6 +150,7 @@ export function blankListingDoc(id: string, sellerIgsid: string, nowIso: string)
     status: "DRAFT",
     photos: [],
     last_photo_at: null,
+    last_activity_at: null,
     extracted: null,
     missing: [],
     moderation: null,

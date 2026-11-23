@@ -95,6 +95,14 @@ export interface ListingDoc {
   status: ListingStatus;
   photos: ListingPhoto[];
   last_photo_at: string | null; // ISO — drives the debounce timer
+  /**
+   * ISO of the last user activity on this listing (photo OR text).
+   * Burst-combine (2026-11-23): a details text arriving after the photos
+   * must delay extraction until the burst settles, and an extraction that
+   * started before a late photo/text must be discarded, not saved — so
+   * finalize keys its staleness checks on this, not just last_photo_at.
+   */
+  last_activity_at: string | null;
   extracted: ExtractedItem | null;
   missing: string[]; // fields still needed / low confidence
   moderation: ModerationResult | null;
@@ -177,6 +185,14 @@ export type WorkerKind = "ingest" | "message" | "finalize-photos" | "publish" | 
 export interface IngestPayload {
   kind: "ingest";
   message: NormalizedInbound;
+  /**
+   * Download-retry attempt (0-based). Absent on the webhook's first delivery.
+   * When the CDN download fails transiently, handleImage re-enqueues itself
+   * with attempt+1 (max 2) instead of dropping the photo — a slow cold
+   * function must not silently lose a burst photo (2026-11-23: 3 photos sent,
+   * only 1 survived in lst_84dd9f3355b3).
+   */
+  attempt?: number | undefined;
 }
 export interface MessagePayload {
   kind: "message";
@@ -187,6 +203,20 @@ export interface FinalizePhotosPayload {
   kind: "finalize-photos";
   listing_id: string;
   photo_at: string; // ISO of the photo that armed the timer; skip if last_photo_at differs
+  /**
+   * ISO of the last user activity (photo or text) when this run was armed.
+   * Burst-combine (2026-11-23): a details text re-arms finalize with a fresh
+   * activity_at, so the run that started before the text skips itself and
+   * extraction waits for the whole burst (photos + text) to settle.
+   * Absent on old in-flight jobs — those fall back to the photo_at guard.
+   */
+  activity_at?: string | undefined;
+  /**
+   * How many times this finalize was re-armed by activity arriving during
+   * extraction (see handleFinalizePhotos). Capped at 4 — after that the run
+   * proceeds with the data it extracted rather than looping forever.
+   */
+  rearm?: number | undefined;
   /**
    * Retry attempt (0-based). Absent on the first run. On a transient failure
    * finalize re-enqueues itself with attempt+1 (max 2) instead of failing

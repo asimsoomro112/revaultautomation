@@ -61,6 +61,7 @@ export function buildDeps(): Deps {
     buildCaption,
     now: () => new Date().toISOString(),
     maxListingsPerSellerPerDay: getEnv().MAX_LISTINGS_PER_SELLER_PER_DAY,
+    photoDebounceSeconds: getEnv().PHOTO_DEBOUNCE_SECONDS,
   };
 }
 

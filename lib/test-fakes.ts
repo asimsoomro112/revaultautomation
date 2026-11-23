@@ -344,6 +344,7 @@ export function makeFakeDeps(overrides: Partial<FakeDb> = {}): FakeDeps {
     buildCaption: async () => "test caption #revault",
     now: () => deps.nowValue,
     maxListingsPerSellerPerDay: 5,
+    photoDebounceSeconds: 25,
   };
   return deps;
 }

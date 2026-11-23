@@ -11,7 +11,12 @@
  *   active DRAFT/NEEDS_INFO listing via transactional getOrCreateActiveListing,
  *   else a new one), append the photo transactionally, ensure the
  *   conversation is COLLECTING, (re)schedule finalize-photos after
- *   PHOTO_DEBOUNCE_SECONDS carrying photo_at = this photo's timestamp.
+ *   PHOTO_DEBOUNCE_SECONDS carrying photo_at = this photo's timestamp and
+ *   activity_at = the same instant (burst-combine: any later photo or text
+ *   re-arms the timer with a fresh activity_at, so extraction waits for the
+ *   whole burst — all photos + the details text — to settle).
+ *   A failed CDN download re-enqueues the ingest itself (bounded, 30s
+ *   apart) instead of dropping the photo on a transient failure.
  * - text | quick_reply | unsupported → hand to the message worker (Phase 2
  *   owns replies, incl. the polite "send photos as images" reply).
  * - echo | unknown → log and ignore.
@@ -46,6 +51,7 @@ const normalizedInboundSchema = z.object({
 const ingestPayloadSchema = z.object({
   kind: z.literal("ingest"),
   message: normalizedInboundSchema,
+  attempt: z.number().int().nonnegative().optional(),
 });
 
 const messagePayloadSchema = z.object({
@@ -58,6 +64,8 @@ const finalizePhotosPayloadSchema = z.object({
   kind: z.literal("finalize-photos"),
   listing_id: z.string(),
   photo_at: z.string(),
+  activity_at: z.string().optional(),
+  rearm: z.number().int().nonnegative().optional(),
   attempt: z.number().int().nonnegative().optional(),
 });
 
@@ -123,11 +131,20 @@ export interface IngestDeps {
 }
 
 export interface IngestResult {
-  action: "photo-saved" | "enqueued-message" | "ignored";
+  action: "photo-saved" | "photo-retry" | "enqueued-message" | "ignored";
   listingId?: string;
 }
 
-async function handleImage(message: NormalizedInbound, deps: IngestDeps, now: string): Promise<IngestResult> {
+/** Bounded self-retries of a failed CDN download before giving up (see handleImage). */
+const INGEST_MAX_DOWNLOAD_RETRIES = 2;
+const INGEST_DOWNLOAD_RETRY_DELAY_SEC = 30;
+
+async function handleImage(
+  message: NormalizedInbound,
+  deps: IngestDeps,
+  now: string,
+  attempt: number,
+): Promise<IngestResult> {
   const igsid = message.sender_igsid;
 
   if (!message.image_url) {
@@ -165,13 +182,41 @@ async function handleImage(message: NormalizedInbound, deps: IngestDeps, now: st
   let downloadedBytes = 0;
   const alreadySaved = await deps.mutateListing(listingId, (doc) => {
     if (doc.photos.some((p) => p.storage_path === destPath)) {
-      return { patch: { last_photo_at: now }, result: true };
+      return { patch: { last_photo_at: now, last_activity_at: now }, result: true };
     }
-    return { patch: { last_photo_at: now }, result: false };
+    return { patch: { last_photo_at: now, last_activity_at: now }, result: false };
   });
   if (!alreadySaved) {
-    const { bytes } = await deps.downloadImage(message.image_url, destPath);
-    downloadedBytes = bytes;
+    // A transient download failure (cold function, CDN blip) must not
+    // silently lose a burst photo: re-enqueue this same ingest, bounded,
+    // instead of failing the worker (QStash retries the 500 too, but its
+    // schedule is out of our control — this retry lands 30s later on a
+    // warm function). The append below is idempotent on storage_path, so
+    // a double delivery can never duplicate the photo.
+    let downloaded: { bytes: number };
+    try {
+      downloaded = await deps.downloadImage(message.image_url, destPath);
+    } catch (err) {
+      if (attempt < INGEST_MAX_DOWNLOAD_RETRIES) {
+        log.warn("ingest: photo download failed — re-enqueueing ingest", {
+          listingId,
+          mid: message.mid,
+          attempt: attempt + 1,
+          error: err instanceof Error ? err.message : String(err),
+        });
+        await deps.enqueue(
+          "ingest",
+          { kind: "ingest", message, attempt: attempt + 1 },
+          {
+            delaySec: INGEST_DOWNLOAD_RETRY_DELAY_SEC,
+            deduplicationId: `${message.mid}-retry-${attempt + 1}`,
+          },
+        );
+        return { action: "photo-retry", listingId };
+      }
+      throw err;
+    }
+    downloadedBytes = downloaded.bytes;
 
     const photo: ListingPhoto = {
       storage_path: destPath,
@@ -185,9 +230,9 @@ async function handleImage(message: NormalizedInbound, deps: IngestDeps, now: st
     // retry of this same mid could have appended it meanwhile.
     await deps.mutateListing(listingId, (doc) => {
       if (doc.photos.some((p) => p.storage_path === destPath)) {
-        return { patch: { last_photo_at: now }, result: true };
+        return { patch: { last_photo_at: now, last_activity_at: now }, result: true };
       }
-      return { patch: { photos: [...doc.photos, photo], last_photo_at: now }, result: false };
+      return { patch: { photos: [...doc.photos, photo], last_photo_at: now, last_activity_at: now }, result: false };
     });
   } else {
     log.info("ingest: duplicate photo delivery skipped", { listingId });
@@ -200,10 +245,13 @@ async function handleImage(message: NormalizedInbound, deps: IngestDeps, now: st
   });
 
   // (Re)arm the photo debounce timer. finalize-photos skips itself when
-  // last_photo_at has moved on (a newer photo re-armed the timer).
+  // last_photo_at has moved on (a newer photo re-armed the timer), and when
+  // last_activity_at has moved on (a details text re-armed it — see
+  // lib/conversation.ts). activity_at carries this photo's instant so the
+  // finalize can tell a quiet burst from one still arriving.
   await deps.enqueue(
     "finalize-photos",
-    { kind: "finalize-photos", listing_id: listingId, photo_at: now },
+    { kind: "finalize-photos", listing_id: listingId, photo_at: now, activity_at: now },
     {
       delaySec: deps.getPhotoDebounceSeconds(),
       deduplicationId: `finalize-${listingId}-${now}`,
@@ -224,7 +272,7 @@ export async function processIngest(payload: IngestPayload, deps: IngestDeps): P
 
   switch (message.kind) {
     case "image":
-      return handleImage(message, deps, now);
+      return handleImage(message, deps, now, payload.attempt ?? 0);
     case "text":
     case "quick_reply":
     case "unsupported":
