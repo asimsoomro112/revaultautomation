@@ -1,15 +1,8 @@
 "use client";
 
 import { useCallback, useEffect, useState } from "react";
-import { adminFetch, ApiError, type PublishLogRow } from "./api";
+import { adminFetch, ApiError, fmtLatency, type PublishLogRow } from "./api";
 import styles from "../styles.module.css";
-
-function fmtLatency(s: number | null): string {
-  if (s == null) return "—";
-  if (s < 60) return `${s}s`;
-  if (s < 3600) return `${Math.round(s / 60)}m`;
-  return `${(s / 3600).toFixed(1)}h`;
-}
 
 export default function PublishLog() {
   const [rows, setRows] = useState<PublishLogRow[] | null>(null);

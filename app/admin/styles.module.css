@@ -88,7 +88,8 @@
   z-index: 1;
 }
 
-/* Mobile bottom navigation: fixed bar of anchor links to the sections. */
+/* Mobile bottom navigation: fixed bar of anchor links to the sections.
+   Nine links no longer fit one row, so the bar scrolls horizontally. */
 .bottomNav {
   position: fixed;
   left: 0;
@@ -96,19 +97,25 @@
   bottom: 0;
   z-index: 50;
   display: flex;
+  overflow-x: auto;
+  scrollbar-width: none;
   background: var(--rv-surface);
   border-top: 1px solid var(--rv-border);
   padding-bottom: env(safe-area-inset-bottom, 0px);
 }
 
+.bottomNav::-webkit-scrollbar {
+  display: none;
+}
+
 .bottomNavLink {
-  flex: 1;
+  flex: 0 0 auto;
   min-width: 0;
   min-height: 56px;
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 8px 4px;
+  padding: 8px 16px;
   font-size: 13px;
   font-weight: 600;
   color: var(--rv-muted);
@@ -223,6 +230,22 @@
   border: 1px solid var(--rv-border);
   border-radius: 10px;
   padding: 8px 12px;
+  /* Summary chips are filter buttons now. */
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  transition: border-color var(--rv-dur) var(--rv-ease), background-color var(--rv-dur) var(--rv-ease);
+}
+
+.summaryItem:focus-visible {
+  outline: none;
+  border-color: var(--rv-accent);
+  box-shadow: 0 0 0 3px rgb(34 197 94 / 0.2);
+}
+
+.summaryItemActive {
+  border-color: var(--rv-accent);
+  background: var(--rv-accent-soft);
 }
 
 .summaryCount {
@@ -830,5 +853,109 @@
 
   .card:hover {
     border-color: var(--rv-border-strong);
+  }
+}
+
+/* --- 5-feature additions (2026-11-23) --- */
+
+/* Stats row: 2 columns on mobile, 4 on wider screens. */
+.statGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.stat {
+  background: var(--rv-surface);
+  border: 1px solid var(--rv-border);
+  border-radius: var(--rv-radius-md);
+  padding: 16px;
+}
+
+.statValue {
+  font-size: 26px;
+  font-weight: 700;
+  color: var(--rv-text);
+  line-height: 1.2;
+}
+
+.statLabel {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--rv-muted);
+}
+
+/* Queue search input above the status chips. */
+.filterBar {
+  margin-bottom: 12px;
+}
+
+/* Settings form. */
+.formGrid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 16px;
+}
+
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.fieldLabel {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--rv-text-2);
+}
+
+.fieldHint {
+  font-size: 12px;
+  color: var(--rv-faint);
+}
+
+.timeRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.timeRow .input {
+  flex: 1;
+  min-width: 0;
+}
+
+.formActions {
+  display: flex;
+  margin-top: 20px;
+}
+
+.formActions .btn {
+  flex: 1 1 auto;
+}
+
+/* Success notice (settings saved). */
+.notice {
+  background: var(--rv-accent-soft);
+  border: 1px solid rgb(34 197 94 / 0.35);
+  color: #86efac;
+  border-radius: var(--rv-radius-md);
+  padding: 12px 14px;
+  font-size: 14px;
+  font-weight: 500;
+  margin-bottom: 16px;
+}
+
+@media (min-width: 640px) {
+  .statGrid {
+    grid-template-columns: repeat(4, 1fr);
+  }
+
+  .formGrid {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .formActions .btn {
+    flex: 0 0 auto;
   }
 }

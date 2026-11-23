@@ -12,11 +12,15 @@ import { useEffect, useState } from "react";
 import { onAuthStateChanged, signOut, type User } from "firebase/auth";
 import { getClientAuth, getClientConfigError } from "./firebase-client";
 import SignInScreen from "./components/SignInScreen";
+import StatsRow from "./components/StatsRow";
 import QueueSection from "./components/QueueSection";
 import PublishLog from "./components/PublishLog";
 import QuotaGauge from "./components/QuotaGauge";
 import KillSwitch from "./components/KillSwitch";
 import TokenHealth from "./components/TokenHealth";
+import SettingsSection from "./components/SettingsSection";
+import ActivityFeed from "./components/ActivityFeed";
+import BannedSellers from "./components/BannedSellers";
 import BottomNav from "./components/BottomNav";
 import LogoMark from "../components/LogoMark";
 import { adminFetch } from "./components/api";
@@ -107,6 +111,7 @@ export default function AdminPage() {
         </div>
       </header>
       <main className={styles.main}>
+        <StatsRow />
         <QueueSection />
         <div className={styles.grid2}>
           <QuotaGauge />
@@ -114,6 +119,9 @@ export default function AdminPage() {
         </div>
         <KillSwitch />
         <PublishLog />
+        <SettingsSection />
+        <ActivityFeed />
+        <BannedSellers />
       </main>
       <BottomNav />
     </div>

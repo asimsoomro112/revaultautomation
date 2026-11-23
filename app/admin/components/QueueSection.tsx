@@ -149,7 +149,8 @@ function ListingCard({
             if (!window.confirm(`Ban seller ${item.seller}? They will be blocked from submitting.`))
               return;
             const reason = window.prompt("Ban reason:") ?? "banned by admin";
-            run("ban", () => post(`/sellers/${item.seller}/ban`, { reason }));
+            // Full IGSID — the truncated display id never matches the blocklist.
+            run("ban", () => post(`/sellers/${item.seller_igsid ?? item.seller}/ban`, { reason }));
           }}
         >
           Ban seller
@@ -176,6 +177,8 @@ const STATUS_LABELS: Record<string, string> = {
 export default function QueueSection() {
   const [items, setItems] = useState<QueueItem[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [query, setQuery] = useState("");
+  const [statusFilter, setStatusFilter] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -193,6 +196,24 @@ export default function QueueSection() {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     load();
   }, [load]);
+
+  // Filtered list derived during render — never stored in state.
+  const q = query.trim().toLowerCase();
+  const visible = (items ?? []).filter((item) => {
+    if (statusFilter && item.status !== statusFilter) return false;
+    if (!q) return true;
+    const haystack = [
+      item.id,
+      item.seller,
+      item.extracted?.title ?? "",
+      item.extracted?.category ?? "",
+      item.extracted?.brand ?? "",
+    ]
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(q);
+  });
+  const filtering = q !== "" || statusFilter !== null;
   return (
     <section className={`${styles.section} ${styles.sectionFlat}`} id="queue">
       <div className={styles.sectionHead}>
@@ -209,25 +230,54 @@ export default function QueueSection() {
         <div className={styles.empty}>Queue is clear — nothing needs review.</div>
       )}
       {items !== null && items.length > 0 && (
-        <div className={styles.summary}>
-          <span className={styles.summaryItem}>
-            <span className={styles.summaryCount}>{items.length}</span>
-            <span className={styles.summaryLabel}>Total</span>
-          </span>
-          {Object.entries(STATUS_LABELS).map(([status, label]) => {
-            const n = items.filter((i) => i.status === status).length;
-            if (n === 0) return null;
-            return (
-              <span key={status} className={styles.summaryItem}>
-                <span className={styles.summaryCount}>{n}</span>
-                <span className={styles.summaryLabel}>{label}</span>
-              </span>
-            );
-          })}
-        </div>
+        <>
+          <div className={styles.filterBar}>
+            <input
+              className={styles.input}
+              type="search"
+              aria-label="Search queue"
+              placeholder="Search by title, listing id or seller…"
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+            />
+          </div>
+          <div className={styles.summary} role="group" aria-label="Filter by status">
+            <button
+              type="button"
+              className={`${styles.summaryItem} ${statusFilter === null ? styles.summaryItemActive : ""}`}
+              aria-pressed={statusFilter === null}
+              onClick={() => setStatusFilter(null)}
+            >
+              <span className={styles.summaryCount}>{items.length}</span>
+              <span className={styles.summaryLabel}>All</span>
+            </button>
+            {Object.entries(STATUS_LABELS).map(([status, label]) => {
+              const n = items.filter((i) => i.status === status).length;
+              if (n === 0) return null;
+              return (
+                <button
+                  type="button"
+                  key={status}
+                  className={`${styles.summaryItem} ${statusFilter === status ? styles.summaryItemActive : ""}`}
+                  aria-pressed={statusFilter === status}
+                  onClick={() => setStatusFilter(statusFilter === status ? null : status)}
+                >
+                  <span className={styles.summaryCount}>{n}</span>
+                  <span className={styles.summaryLabel}>{label}</span>
+                </button>
+              );
+            })}
+          </div>
+          {filtering && (
+            <div className={styles.muted}>
+              Showing {visible.length} of {items.length}
+              {visible.length === 0 ? " — nothing matches." : "."}
+            </div>
+          )}
+        </>
       )}
       <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
-        {(items ?? []).map((item) => (
+        {visible.map((item) => (
           <ListingCard key={item.id} item={item} onChanged={load} />
         ))}
       </div>

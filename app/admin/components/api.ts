@@ -42,6 +42,8 @@ export interface QueueItem {
   id: string;
   status: string;
   seller: string;
+  /** Full seller IGSID (never displayed) — the Ban action needs the real id. */
+  seller_igsid: string;
   created_at: string;
   caption: string | null;
   extracted: {
@@ -87,6 +89,32 @@ export interface SettingsInfo {
   min_gap_minutes: number;
   posting_window: { start: string; end: string; tz: string };
   retention_days: number;
+  max_listings_per_seller_per_day: number;
+  photo_debounce_seconds: number;
+}
+
+export interface ActivityItem {
+  id: string;
+  listing_id: string | null;
+  type: string;
+  at: string | null;
+  by: string | null;
+  detail: string | null;
+}
+
+export interface BannedSeller {
+  igsid: string;
+  reason: string;
+  at: string | null;
+  by: string | null;
+}
+
+/** Publish latency (seconds) → "45s" / "12m" / "2.5h", shared by log + stats. */
+export function fmtLatency(s: number | null): string {
+  if (s == null) return "—";
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.round(s / 60)}m`;
+  return `${(s / 3600).toFixed(1)}h`;
 }
 
 export interface TokenHealthInfo {

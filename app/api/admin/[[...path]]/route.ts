@@ -51,6 +51,27 @@ const killSwitchBody = z.object({ on: z.boolean() });
 const reasonBody = z.object({ reason: z.string().min(1).max(500) });
 const tokenBody = z.object({ token: z.string().min(20) });
 
+// Partial settings update — every field optional, but at least one is required.
+// Bounds match the env-backed defaults (lib/env.ts) so the UI can never write
+// a value the workers would reject.
+const hhmm = z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Use HH:MM (24-hour)");
+const settingsBody = z
+  .object({
+    publish_mode: z.enum(["review", "auto", "dry_run"]).optional(),
+    max_posts_per_day: z.number().int().min(1).max(50).optional(),
+    min_gap_minutes: z.number().int().min(0).max(1440).optional(),
+    posting_window: z
+      .object({ start: hhmm, end: hhmm, tz: z.string().min(1).max(64) })
+      .optional(),
+    retention_days: z.number().int().min(1).max(365).optional(),
+    max_listings_per_seller_per_day: z.number().int().min(1).max(50).optional(),
+    photo_debounce_seconds: z.number().int().min(5).max(300).optional(),
+  })
+  .strict()
+  .refine((v) => Object.keys(v).length > 0, {
+    message: "At least one setting is required",
+  });
+
 // --- helpers --------------------------------------------------------------
 
 type Ctx = { params: Promise<{ path?: string[] }> };
@@ -99,6 +120,8 @@ function listingSummary(d: { id: string; data: () => unknown }) {
     id: d.id,
     status: data.status,
     seller: truncId(data.seller_igsid),
+    // Full IGSID, never displayed — the Ban action posts it to /sellers/:id/ban.
+    seller_igsid: data.seller_igsid,
     created_at: data.created_at,
     caption: data.caption,
     extracted: data.extracted,
@@ -114,7 +137,28 @@ function listingSummary(d: { id: string; data: () => unknown }) {
   };
 }
 
-/** Best-effort seller DM via the Meta client (Phase 4 may not have landed yet). */
+/** Public settings shape — the same fields GET returns and POST echoes back. */
+function settingsResponse(s: {
+  global_kill_switch: boolean;
+  publish_mode: string;
+  max_posts_per_day: number;
+  min_gap_minutes: number;
+  posting_window: { start: string; end: string; tz: string };
+  retention_days: number;
+  max_listings_per_seller_per_day: number;
+  photo_debounce_seconds: number;
+}) {
+  return {
+    kill_switch: s.global_kill_switch,
+    publish_mode: s.publish_mode,
+    max_posts_per_day: s.max_posts_per_day,
+    min_gap_minutes: s.min_gap_minutes,
+    posting_window: s.posting_window,
+    retention_days: s.retention_days,
+    max_listings_per_seller_per_day: s.max_listings_per_seller_per_day,
+    photo_debounce_seconds: s.photo_debounce_seconds,
+  };
+}
 async function tryNotifySeller(igsid: string, text: string): Promise<void> {
   try {
     const { getMetaClient } = await import("@/lib/meta");
@@ -243,14 +287,53 @@ async function handleGet(path: string[]) {
   // GET /api/admin/settings
   if (a === "settings" && !b) {
     const s = await getAdminSettings();
-    return NextResponse.json({
-      kill_switch: s.global_kill_switch,
-      publish_mode: s.publish_mode,
-      max_posts_per_day: s.max_posts_per_day,
-      min_gap_minutes: s.min_gap_minutes,
-      posting_window: s.posting_window,
-      retention_days: s.retention_days,
+    return NextResponse.json(settingsResponse(s));
+  }
+
+  // GET /api/admin/activity — latest audit events across all listings.
+  // collectionGroup + single-field orderBy needs no composite index.
+  if (a === "activity" && !b) {
+    const snap = await adminDb()
+      .collectionGroup("events")
+      .orderBy("at", "desc")
+      .limit(25)
+      .get();
+    const items = snap.docs.map((e) => {
+      const data = e.data() as {
+        type?: string;
+        at?: string;
+        by?: string | null;
+        detail?: string | null;
+      };
+      return {
+        id: e.id,
+        listing_id: e.ref.parent.parent?.id ?? null,
+        type: data.type ?? "unknown",
+        at: data.at ?? null,
+        by: data.by ?? null,
+        detail: data.detail ?? null,
+      };
     });
+    return NextResponse.json({ items });
+  }
+
+  // GET /api/admin/sellers/banned — blocklist docs (id = seller IGSID).
+  if (a === "sellers" && b === "banned") {
+    const snap = await adminDb()
+      .collection("blocklist")
+      .orderBy("at", "desc")
+      .limit(50)
+      .get();
+    const items = snap.docs.map((d) => {
+      const data = d.data() as { reason?: string; at?: string; by?: string };
+      return {
+        igsid: d.id,
+        reason: data.reason ?? "",
+        at: data.at ?? null,
+        by: data.by ?? null,
+      };
+    });
+    return NextResponse.json({ items });
   }
 
   // GET /api/admin/token-health
@@ -381,6 +464,20 @@ async function handlePost(
     return NextResponse.json({ ok: true });
   }
 
+  // POST /api/admin/sellers/:igsid/unban
+  if (a === "sellers" && b && c === "unban") {
+    const ref = adminDb().doc(`blocklist/${b}`);
+    const snap = await ref.get();
+    if (!snap.exists) {
+      return NextResponse.json({ error: "Seller is not banned" }, { status: 404 });
+    }
+    await ref.delete();
+    await adminDb().doc(`conversations/${b}`).set({ blocked: false }, { merge: true });
+    await notifyAdmin(`✅ Seller unbanned by ${by}\nIGSID: ${truncId(b)}`);
+    log.info("admin-api: seller unbanned", { by });
+    return NextResponse.json({ ok: true });
+  }
+
   // POST /api/admin/kill-switch {on}
   if (a === "kill-switch" && !b) {
     const parsed = killSwitchBody.safeParse(body);
@@ -395,6 +492,28 @@ async function handlePost(
     );
     log.info("admin-api: kill switch toggled", { on: parsed.data.on, by });
     return NextResponse.json({ ok: true, kill_switch: parsed.data.on });
+  }
+
+  // POST /api/admin/settings — partial update, validated by settingsBody.
+  // kill_switch is intentionally NOT writable here (use /kill-switch).
+  if (a === "settings" && !b) {
+    const parsed = settingsBody.safeParse(body);
+    if (!parsed.success) {
+      const detail = parsed.error.issues
+        .map((i) => `${i.path.join(".")}: ${i.message}`)
+        .join("; ");
+      return NextResponse.json(
+        { error: `Invalid settings: ${detail}` },
+        { status: 400 },
+      );
+    }
+    await updateAdminSettings(parsed.data);
+    const s = await getAdminSettings();
+    log.info("admin-api: settings updated", {
+      by,
+      keys: Object.keys(parsed.data).join(","),
+    });
+    return NextResponse.json({ ok: true, settings: settingsResponse(s) });
   }
 
   // POST /api/admin/token-refresh
