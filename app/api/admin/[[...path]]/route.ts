@@ -382,6 +382,12 @@ async function handleGet(path: string[]) {
   // GET /api/admin/token-health
   if (a === "token-health" && !b) {
     const s = await getAdminSettings();
+    // Whether the daily Vercel cron can refresh the token at all: the cron
+    // route fails closed (401) when CRON_SECRET is unset, so a missing
+    // secret means the token NEVER auto-refreshes and the expiry silently
+    // counts down. Surface it here (presence only, never the value) so
+    // /admin shows the gap instead of Telegram (which is not configured).
+    const cronConfigured = Boolean(getEnv().CRON_SECRET);
     if (!s.token) {
       return NextResponse.json({
         health: "missing",
@@ -389,6 +395,7 @@ async function handleGet(path: string[]) {
         days_left: null,
         ig_user_id: s.ig_user_id || null,
         updated_at: null,
+        cron_configured: cronConfigured,
       });
     }
     return NextResponse.json({
@@ -397,6 +404,7 @@ async function handleGet(path: string[]) {
       days_left: daysUntilExpiry(s.token.expires_at),
       ig_user_id: s.ig_user_id || null,
       updated_at: s.token.updated_at,
+      cron_configured: cronConfigured,
     });
   }
 

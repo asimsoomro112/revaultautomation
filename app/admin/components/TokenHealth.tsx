@@ -85,6 +85,13 @@ export default function TokenHealth() {
           </button>
         </div>
       )}
+      {health && (
+        <div className={health.cron_configured ? styles.muted : styles.alert}>
+          {health.cron_configured
+            ? "Automatic refresh: ON — the daily cron renews the token when under 7 days are left."
+            : "Automatic refresh: OFF — CRON_SECRET is not set in Vercel, so the daily cron cannot run and this token will NOT auto-refresh. Refresh manually above, or set CRON_SECRET."}
+        </div>
+      )}
       {health && health.days_left != null && (
         <div className={styles.tokenBar}>
           <div

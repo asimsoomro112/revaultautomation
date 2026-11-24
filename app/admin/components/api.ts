@@ -128,4 +128,6 @@ export interface TokenHealthInfo {
   days_left: number | null;
   ig_user_id: string | null;
   updated_at: string | null;
+  /** Whether CRON_SECRET is set, i.e. the daily token-refresh cron can run. */
+  cron_configured: boolean;
 }

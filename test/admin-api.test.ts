@@ -32,6 +32,9 @@ const mocks = vi.hoisted(() => {
   return {
     authOk: true,
     settings,
+    // Env surface for getEnv(): tests toggle CRON_SECRET here to prove the
+    // token-health endpoint reports whether the daily refresh cron can run.
+    env: { TimeZone: "Asia/Karachi", MAX_POSTS_PER_DAY: 6, CRON_SECRET: undefined as string | undefined },
     blocklist: new Map<string, { reason: string; at: string; by: string }>(),
     conversations: new Map<string, Record<string, unknown>>(),
     listings: [] as Array<{ id: string; created_at: string }>,
@@ -189,7 +192,7 @@ vi.mock("@/lib/firebase-admin", () => {
 });
 vi.mock("@/lib/storage", () => ({ signedReadUrl: vi.fn(async () => "") }));
 vi.mock("@/lib/env", () => ({
-  getEnv: () => ({ TimeZone: "Asia/Karachi", MAX_POSTS_PER_DAY: 6 }),
+  getEnv: () => mocks.env,
 }));
 vi.mock("@/lib/log", () => ({
   log: { info: vi.fn(), warn: vi.fn(), error: vi.fn() },
@@ -228,6 +231,7 @@ function postReq(path: string, body: unknown) {
 
 beforeEach(() => {
   mocks.authOk = true;
+  mocks.env.CRON_SECRET = undefined;
   mocks.blocklist.clear();
   mocks.conversations.clear();
   mocks.listings.length = 0;
@@ -336,6 +340,51 @@ describe("GET /api/admin/sellers/banned", () => {
     expect(data.items[0]?.igsid).toBe("222");
     expect(data.items[0]?.reason).toBe("abuse");
     expect(data.items[1]?.igsid).toBe("111");
+  });
+});
+
+describe("GET /api/admin/token-health", () => {
+  // The cron route fails closed (401) when CRON_SECRET is unset, so a
+  // missing secret means the token NEVER auto-refreshes and the expiry
+  // silently counts down. The endpoint must surface that gap (presence
+  // only, never the value) so /admin shows it instead of Telegram.
+  const withToken = () => {
+    Object.assign(mocks.settings, {
+      token: {
+        enc: "x",
+        iv: "y",
+        expires_at: "2026-12-01T00:00:00.000Z",
+        updated_at: "2026-10-02T00:00:00.000Z",
+      },
+      token_health: "ok",
+    });
+  };
+
+  it("reports cron_configured false when CRON_SECRET is absent (auto-refresh cannot run)", async () => {
+    withToken();
+    const res = await GET(getReq("token-health"), ctx(["token-health"]));
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as { cron_configured: boolean; health: string; days_left: number };
+    expect(data.cron_configured).toBe(false);
+    expect(data.health).toBe("ok");
+    expect(data.days_left).toBe(10); // mocked daysUntilExpiry
+  });
+
+  it("reports cron_configured true when CRON_SECRET is set", async () => {
+    mocks.env.CRON_SECRET = "test-cron-secret";
+    withToken();
+    const res = await GET(getReq("token-health"), ctx(["token-health"]));
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as { cron_configured: boolean };
+    expect(data.cron_configured).toBe(true);
+  });
+
+  it("reports cron_configured false in the missing-token branch too", async () => {
+    const res = await GET(getReq("token-health"), ctx(["token-health"]));
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as { cron_configured: boolean; health: string };
+    expect(data.health).toBe("missing");
+    expect(data.cron_configured).toBe(false);
   });
 });
 
