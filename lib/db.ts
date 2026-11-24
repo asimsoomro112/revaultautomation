@@ -151,6 +151,7 @@ export function blankListingDoc(id: string, sellerIgsid: string, nowIso: string)
     photos: [],
     last_photo_at: null,
     last_activity_at: null,
+    inflight_photos: 0,
     extracted: null,
     missing: [],
     moderation: null,

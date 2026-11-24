@@ -205,6 +205,28 @@ describe("processIngest — image", () => {
       "raw/lst_test123/m_b2.jpg",
       "raw/lst_test123/m_b3.jpg",
     ]);
+    // Burst fix (2026-11-24): every download's inflight claim is released
+    // once its photo lands, so a later finalize never waits on a stale count.
+    expect(listing?.inflight_photos).toBe(0);
+  });
+
+  it("inflight counter is 1 during the download and 0 after the append (burst fix 2026-11-24)", async () => {
+    const { deps, listings } = makeDeps();
+    const seenDuringDownload: (number | undefined)[] = [];
+    deps.downloadImage = async () => {
+      // The finalize guard reads this counter: while the download is in
+      // flight it must be 1, so a finalize cannot close the burst early.
+      seenDuringDownload.push(listings.get("lst_test123")?.inflight_photos);
+      return { bytes: 4242 };
+    };
+    await processIngest(
+      { kind: "ingest", message: makeInbound("image", "m_img1", { image_url: "https://cdn.example/a.jpg" }) },
+      deps,
+    );
+    expect(seenDuringDownload).toEqual([1]);
+    const listing = listings.get("lst_test123");
+    expect(listing?.photos).toHaveLength(1);
+    expect(listing?.inflight_photos).toBe(0);
   });
 
   it("a duplicate delivery of the same photo (same mid) appends it only once", async () => {
@@ -218,6 +240,8 @@ describe("processIngest — image", () => {
     expect(listing?.photos[0]?.storage_path).toBe("raw/lst_test123/m_img1.jpg");
     // The second delivery skips the download too (the CDN URL may be expired).
     expect(downloads).toHaveLength(1);
+    // A duplicate delivery never claims an inflight download.
+    expect(listing?.inflight_photos).toBe(0);
   });
 
   it("appends a photo to the active NEEDS_INFO listing instead of starting a new one", async () => {
@@ -277,6 +301,10 @@ describe("processIngest — image", () => {
     const res = await processIngest({ kind: "ingest", message: msg }, deps);
     expect(res.action).toBe("photo-retry");
     expect(listings.get("lst_test123")?.photos).toHaveLength(0);
+    // Burst fix (2026-11-24): the failed attempt releases its inflight
+    // claim — the retry claims its own when it runs, so the counter must
+    // not stay stuck at 1 and make every later finalize wait out its cap.
+    expect(listings.get("lst_test123")?.inflight_photos).toBe(0);
     expect(enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(0);
     const retry = enqueued.filter((e) => e.route === "ingest");
     expect(retry).toHaveLength(1);

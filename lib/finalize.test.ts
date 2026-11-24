@@ -35,10 +35,12 @@ function payload(
   photoAt: string,
   attempt?: number,
   activityAt?: string,
+  inflightWaits?: number,
 ): FinalizePhotosPayload {
   const p: FinalizePhotosPayload = { kind: "finalize-photos", listing_id: listingId, photo_at: photoAt };
   if (attempt !== undefined) p.attempt = attempt;
   if (activityAt !== undefined) p.activity_at = activityAt;
+  if (inflightWaits !== undefined) p.inflight_waits = inflightWaits;
   return p;
 }
 
@@ -194,6 +196,94 @@ describe("handleFinalizePhotos: burst-combine — activity during extraction", (
       rearm: 1,
     });
     expect(retry!.opts?.delaySec).toBe(60);
+  });
+});
+
+describe("handleFinalizePhotos: burst fix — in-flight downloads (2026-11-24)", () => {
+  it("waits (re-enqueues) while a photo download is in flight instead of extracting a partial burst", async () => {
+    await seedListing();
+    const listing = deps.fdb.listings.get("lst_1")!;
+    listing.inflight_photos = 1; // a burst photo's download still running
+    const res = await handleFinalizePhotos(payload("lst_1", NOW, undefined, NOW), fdeps);
+    expect(res).toEqual({ ok: true, skipped: "inflight" });
+    // No vision call, nothing extracted, listing untouched.
+    expect(listing.extracted).toBeNull();
+    expect(listing.status).toBe("DRAFT");
+    expect(deps.fdb.events.some((e) => e.event.type === "finalized")).toBe(false);
+    const waited = deps.enqueued.filter((e) => e.route === "finalize-photos");
+    expect(waited).toHaveLength(1);
+    expect(waited[0]?.opts?.delaySec).toBe(15);
+    expect(waited[0]?.payload).toMatchObject({
+      kind: "finalize-photos",
+      listing_id: "lst_1",
+      photo_at: NOW,
+      activity_at: NOW,
+      inflight_waits: 1,
+    });
+    // Fresh dedup id per wait — the plain finalize-{id}-{activity_at} id
+    // would be suppressed inside QStash's 10-minute dedup window.
+    expect(waited[0]?.opts?.deduplicationId).toBe(`finalize-wait-lst_1-${NOW}-1`);
+  });
+
+  it("proceeds after the inflight-wait cap instead of waiting forever", async () => {
+    await seedListing();
+    const listing = deps.fdb.listings.get("lst_1")!;
+    listing.inflight_photos = 1; // a download stuck for 2 minutes
+    // Both caps hit (8 waits, 4 re-arms) so the run proceeds rather than
+    // looping — the 4b check would route to REVIEW if a photo had arrived.
+    const res = await handleFinalizePhotos(
+      { kind: "finalize-photos", listing_id: "lst_1", photo_at: NOW, activity_at: NOW, rearm: 4, inflight_waits: 8 },
+      fdeps,
+    );
+    expect(res).toEqual({ ok: true });
+    expect(listing.extracted).not.toBeNull();
+    expect(listing.status).toBe("CONFIRM"); // makeVisionResult is a complete extraction
+    expect(deps.enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(0);
+  });
+
+  it("re-arms when a photo appends during extraction even though activity_at did not move", async () => {
+    await seedListing();
+    deps.gemini.extractListingImpl = async () => {
+      // A third photo's append lands while Gemini is thinking — but the
+      // append carries the same activity_at the first mutate already set
+      // before the download, so the old activity-only re-check could not
+      // see it and the burst would close on a partial set.
+      await deps.db.mutateListing("lst_1", (doc) => ({
+        patch: {
+          photos: [...doc.photos, makePhoto("sellers/x/2.jpg")],
+          last_photo_at: NOW,
+          last_activity_at: NOW,
+        },
+        result: undefined,
+      }));
+      return makeVisionResult();
+    };
+    const res = await handleFinalizePhotos(payload("lst_1", NOW, undefined, NOW), fdeps);
+    expect(res).toEqual({ ok: true, skipped: "rearmed" });
+    const listing = deps.fdb.listings.get("lst_1")!;
+    expect(listing.extracted).toBeNull();
+    expect(listing.status).toBe("DRAFT");
+    expect(deps.fdb.events.some((e) => e.event.type === "finalize_rearmed")).toBe(true);
+    const rearmed = deps.enqueued.filter((e) => e.route === "finalize-photos");
+    expect(rearmed).toHaveLength(1);
+    expect(rearmed[0]?.payload).toMatchObject({ rearm: 1 });
+  });
+
+  it("re-arms when a download is still in flight after extraction", async () => {
+    await seedListing();
+    deps.gemini.extractListingImpl = async () => {
+      // A photo's download is still running when extraction finishes —
+      // the burst has not settled even though the photo count is unchanged.
+      await deps.db.mutateListing("lst_1", (_doc) => ({
+        patch: { inflight_photos: 1 },
+        result: undefined,
+      }));
+      return makeVisionResult();
+    };
+    const res = await handleFinalizePhotos(payload("lst_1", NOW, undefined, NOW), fdeps);
+    expect(res).toEqual({ ok: true, skipped: "rearmed" });
+    expect(deps.fdb.listings.get("lst_1")!.extracted).toBeNull();
+    expect(deps.enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(1);
   });
 });
 

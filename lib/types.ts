@@ -103,6 +103,17 @@ export interface ListingDoc {
    * finalize keys its staleness checks on this, not just last_photo_at.
    */
   last_activity_at: string | null;
+  /**
+   * Burst fix (2026-11-24): how many photo downloads are currently in
+   * flight for this listing. Ingest bumps this BEFORE the slow Meta CDN
+   * fetch + Cloudinary upload and drops it when the photo is appended (or
+   * the download fails). Finalize refuses to extract while this is > 0 —
+   * the old timestamp-only guards could not see a download in flight, so
+   * a finalize fired 25s after a photo's ingest start could read 1 photo
+   * with "fresh" timestamps and close the burst on a partial set.
+   * Absent (old docs) reads as 0.
+   */
+  inflight_photos?: number | undefined;
   extracted: ExtractedItem | null;
   missing: string[]; // fields still needed / low confidence
   moderation: ModerationResult | null;
@@ -231,6 +242,14 @@ export interface FinalizePhotosPayload {
    * with nothing extracted (2026-11-23: Nina's listing, lst_a5fa2b817b16).
    */
   attempt?: number | undefined;
+  /**
+   * Burst fix (2026-11-24): how many times this run has waited for
+   * in-flight photo downloads to land before extracting. Capped — after
+   * the cap the run proceeds anyway and the 4b check routes to REVIEW if
+   * photos arrived during extraction, so a stuck download can never
+   * strand a listing forever.
+   */
+  inflight_waits?: number | undefined;
 }
 export interface PublishPayload {
   kind: "publish";

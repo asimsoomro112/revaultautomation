@@ -45,6 +45,15 @@ const FINALIZE_RETRY_DELAY_SEC = 60;
  */
 const FINALIZE_MAX_REARMS = 4;
 
+/**
+ * Waits for in-flight photo downloads before extracting (see the inflight
+ * guard in handleFinalizePhotos). 8 waits x 15s = 2 minutes max — a burst
+ * download slower than that proceeds anyway and the 4b check routes to
+ * REVIEW rather than auto-passing a partial set.
+ */
+const FINALIZE_MAX_INFLIGHT_WAITS = 8;
+const FINALIZE_INFLIGHT_WAIT_SEC = 15;
+
 const PROCESSABLE = new Set(["DRAFT", "NEEDS_INFO"]);
 
 async function markNeedsReview(
@@ -109,6 +118,47 @@ export async function handleFinalizePhotos(
     log.info("finalize.skipped_status", { listing_id: listing.id, status: listing.status });
     return { ok: true, skipped: "status" };
   }
+  // Burst fix (2026-11-24): a photo download still in flight is invisible
+  // to the timestamp guards above — ingest bumps last_photo_at BEFORE the
+  // slow download, so a finalize fired 25s after an ingest start could
+  // read 1 photo with "fresh" timestamps and close the burst on a partial
+  // set (2026-11-24: 3 photos sent, 1 extracted). Wait for the downloads
+  // to land instead: re-enqueue with a fresh dedup id (the plain
+  // finalize-{id}-{activity_at} id would be suppressed inside QStash's
+  // 10-minute dedup window) and a wait count. After the cap, proceed
+  // anyway — the 4b check below routes to REVIEW if photos arrived during
+  // extraction, so a stuck download can never auto-pass a partial set.
+  const inflight = listing.inflight_photos ?? 0;
+  if (inflight > 0) {
+    const waits = payload.inflight_waits ?? 0;
+    if (waits < FINALIZE_MAX_INFLIGHT_WAITS) {
+      log.info("finalize.waiting_inflight", { listing_id: listing.id, inflight, waits: waits + 1 });
+      await deps.enqueueWorker(
+        "finalize-photos",
+        {
+          kind: "finalize-photos",
+          listing_id: listing.id,
+          photo_at: payload.photo_at,
+          activity_at: payload.activity_at,
+          attempt: payload.attempt,
+          rearm: payload.rearm,
+          inflight_waits: waits + 1,
+        },
+        {
+          delaySec: FINALIZE_INFLIGHT_WAIT_SEC,
+          deduplicationId: `finalize-wait-${listing.id}-${payload.activity_at ?? payload.photo_at}-${waits + 1}`,
+        },
+      );
+      return { ok: true, skipped: "inflight" };
+    }
+    log.warn("finalize.inflight_wait_cap", { listing_id: listing.id, inflight });
+  }
+
+  // Snapshot the photo count at read time for the post-extraction re-check
+  // below: a live object reference (the in-memory fake db returns one;
+  // real Firestore returns a snapshot) would otherwise make a photo that
+  // arrived during extraction invisible to a length comparison.
+  const photoCountAtRead = listing.photos.length;
 
   const convo = await deps.db.getOrCreateConversation(listing.seller_igsid);
 
@@ -155,9 +205,20 @@ export async function handleFinalizePhotos(
     // and re-arm instead; the fresh run extracts the complete burst.
     const expectedActivity = payload.activity_at ?? payload.photo_at;
     const fresh = await deps.db.getListing(payload.listing_id);
+    // Burst fix (2026-11-24): activity_at alone cannot see a photo that
+    // appended during extraction — the append carries the same activity_at
+    // the first mutate already set before the download. A changed photo
+    // count, or a download still in flight, means the burst has not
+    // settled either, so discard and re-arm on those too.
+    const freshInflight = fresh !== null ? (fresh.inflight_photos ?? 0) : 0;
+    const photoCountMoved = fresh !== null && fresh.photos.length !== photoCountAtRead;
     const moved =
-      fresh !== null && fresh.last_activity_at !== null && fresh.last_activity_at !== expectedActivity;
-    if (moved && (payload.rearm ?? 0) < FINALIZE_MAX_REARMS) {
+      (fresh !== null && fresh.last_activity_at !== null && fresh.last_activity_at !== expectedActivity) ||
+      photoCountMoved ||
+      freshInflight > 0;
+    if (fresh !== null && moved && (payload.rearm ?? 0) < FINALIZE_MAX_REARMS) {
+      // `moved` is only true when fresh is non-null (every clause needs
+      // it); the explicit check narrows the type for the block below.
       const rearm = (payload.rearm ?? 0) + 1;
       log.info("finalize.rearmed_by_activity", { listing_id: listing.id, rearm });
       await deps.db.appendListingEvent(listing.id, {

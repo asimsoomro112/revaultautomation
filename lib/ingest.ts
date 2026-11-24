@@ -68,6 +68,7 @@ const finalizePhotosPayloadSchema = z.object({
   activity_at: z.string().optional(),
   rearm: z.number().int().nonnegative().optional(),
   attempt: z.number().int().nonnegative().optional(),
+  inflight_waits: z.number().int().nonnegative().optional(),
 });
 
 const publishPayloadSchema = z.object({
@@ -209,8 +210,36 @@ async function handleImage(
     if (doc.photos.some((p) => p.storage_path === destPath)) {
       return { patch: { last_photo_at: now, last_activity_at: now }, result: true };
     }
-    return { patch: { last_photo_at: now, last_activity_at: now }, result: false };
+    // Burst fix (2026-11-24): claim an in-flight download BEFORE the slow
+    // Meta CDN fetch + Cloudinary upload, so a finalize firing 25s after
+    // this ingest starts can see the download is still running instead of
+    // reading 1 photo with "fresh" timestamps and closing the burst.
+    return {
+      patch: {
+        last_photo_at: now,
+        last_activity_at: now,
+        inflight_photos: (doc.inflight_photos ?? 0) + 1,
+      },
+      result: false,
+    };
   });
+  // Best-effort release of this attempt's inflight claim. A stuck counter
+  // would make every later finalize wait out its cap, so a failed release
+  // must never mask the download error or the retry.
+  const releaseInflight = async () => {
+    try {
+      await deps.mutateListing(listingId, (doc) => ({
+        patch: { inflight_photos: Math.max(0, (doc.inflight_photos ?? 1) - 1) },
+        result: undefined,
+      }));
+    } catch (releaseErr) {
+      log.warn("ingest: inflight release failed", {
+        listingId,
+        mid: message.mid,
+        error: releaseErr instanceof Error ? releaseErr.message : String(releaseErr),
+      });
+    }
+  };
   if (!alreadySaved) {
     // A transient download failure (cold function, CDN blip) must not
     // silently lose a burst photo: re-enqueue this same ingest, bounded,
@@ -222,6 +251,10 @@ async function handleImage(
     try {
       downloaded = await deps.downloadImage(message.image_url, destPath);
     } catch (err) {
+      // Release this attempt's inflight claim: the retry (or QStash's
+      // retry of the 500) claims its own when it runs, so a stuck counter
+      // must not make every later finalize wait out its cap.
+      await releaseInflight();
       if (attempt < INGEST_MAX_DOWNLOAD_RETRIES) {
         log.warn("ingest: photo download failed — re-enqueueing ingest", {
           listingId,
@@ -254,10 +287,25 @@ async function handleImage(
     // check above ran before the download, so re-check here — a concurrent
     // retry of this same mid could have appended it meanwhile.
     await deps.mutateListing(listingId, (doc) => {
+      // Release this attempt's inflight claim in the same transaction as
+      // the append, so finalize can never observe "appended but still
+      // in-flight" (or the reverse).
+      const inflight = Math.max(0, (doc.inflight_photos ?? 1) - 1);
       if (doc.photos.some((p) => p.storage_path === destPath)) {
-        return { patch: { last_photo_at: now, last_activity_at: now }, result: true };
+        return {
+          patch: { last_photo_at: now, last_activity_at: now, inflight_photos: inflight },
+          result: true,
+        };
       }
-      return { patch: { photos: [...doc.photos, photo], last_photo_at: now, last_activity_at: now }, result: false };
+      return {
+        patch: {
+          photos: [...doc.photos, photo],
+          last_photo_at: now,
+          last_activity_at: now,
+          inflight_photos: inflight,
+        },
+        result: false,
+      };
     });
   } else {
     log.info("ingest: duplicate photo delivery skipped", { listingId });
