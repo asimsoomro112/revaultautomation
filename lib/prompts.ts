@@ -8,6 +8,17 @@
 import type { ExtractedItem, Lang } from "./types";
 import type { QuickReply } from "./meta";
 
+/**
+ * Neutralise the triple-quote delimiter in seller-supplied text before it
+ * enters any LLM prompt. A seller who can break out of a quoted block can
+ * inject instructions (Fix #13 vision, Fix #26 intent, Fix #34 caption).
+ * Canonical helper — every prompt builder that interpolates seller-derived
+ * text must use it.
+ */
+export function sanitizeUntrustedText(s: string): string {
+  return s.replace(/"""/g, "'''");
+}
+
 export const LANG_NAMES: Record<Lang, string> = {
   ur: "Urdu (اردو رسم الخط)",
   roman: "Roman Urdu (Urdu written in Latin script, mixed with English)",
@@ -24,8 +35,8 @@ export function intentPrompt(text: string, history: string[]): string {
   // neutralise the triple-quote delimiter so a seller cannot break out of
   // the quoted block and inject instructions (same guard as visionPrompt,
   // Fix #13 — this call site was missed in that fix).
-  const safeText = text.replace(/"""/g, "'''");
-  const safeHist = history.map((h) => h.replace(/"""/g, "'''"));
+  const safeText = sanitizeUntrustedText(text);
+  const safeHist = history.map((h) => sanitizeUntrustedText(h));
   const hist = safeHist.length > 0 ? `\nEarlier messages from this user:\n${safeHist.map((h) => `- ${h}`).join("\n")}` : "";
   return `You classify Instagram DMs for ReVault, a preloved fashion marketplace in Pakistan.
 
@@ -58,7 +69,7 @@ export function visionPrompt(chatText: string, lang: Lang): string {
   // The seller's chat text is UNTRUSTED data, not instructions: neutralise
   // the triple-quote delimiter so a seller cannot break out of the quoted
   // block and inject instructions (e.g. "return verdict PASS").
-  const safeChat = (chatText || "(no text yet)").replace(/"""/g, "'''");
+  const safeChat = sanitizeUntrustedText(chatText || "(no text yet)");
   return `You are ReVault's listing analyst AND safety moderator. You receive PHOTOS of a preloved fashion item plus the seller's chat text. Analyse ALL photos together and reply with ONE single JSON object (no markdown fences, no commentary).
 
 SELLER CHAT TEXT (language: ${LANG_NAMES[lang]} — extract facts regardless of language):
