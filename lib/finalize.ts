@@ -313,8 +313,13 @@ export async function handleFinalizePhotos(
       // during the failed run (e.g. a NEEDS_INFO answer bumps it without
       // re-arming finalize). A retry carrying the stale payload would skip
       // as "rearmed" and strand the listing. The dedup id keeps a duplicate
-      // delivery of this retry from running twice (AGENTS.md idempotency).
+      // delivery of this retry from running twice (AGENTS.md idempotency)
+      // AND carries the fresh activity_at as the failure-cycle
+      // discriminator: an attempt number alone is reused across unrelated
+      // failure cycles, and QStash would suppress the second cycle's retry
+      // inside its dedup window (Lane A NEW-3, 2026-11-24 re-audit).
       const freshRetry = await deps.db.getListing(listing.id);
+      const retryActivity = freshRetry?.last_activity_at ?? payload.activity_at ?? payload.photo_at;
       await deps.enqueueWorker(
         "finalize-photos",
         {
@@ -327,7 +332,7 @@ export async function handleFinalizePhotos(
         },
         {
           delaySec: FINALIZE_RETRY_DELAY_SEC,
-          deduplicationId: `finalize-retry-${listing.id}-${attempt + 1}`,
+          deduplicationId: `finalize-retry-${listing.id}-${attempt + 1}-${retryActivity}`,
         },
       );
       return { ok: true };

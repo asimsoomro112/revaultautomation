@@ -301,7 +301,46 @@ describe("handleFinalizePhotos: stale-run hardening", () => {
     const retry = deps.enqueued.find((e) => e.route === "finalize-photos");
     expect(retry).toBeDefined();
     expect(retry!.payload).toMatchObject({ activity_at: LATE, attempt: 1, rearm: 1 });
-    expect(retry!.opts?.deduplicationId).toBe("finalize-retry-lst_1-1");
+    expect(retry!.opts?.deduplicationId).toBe(`finalize-retry-lst_1-1-${LATE}`);
+  });
+
+  it("retries from different failure cycles get distinct deduplicationIds (same attempt number)", async () => {
+    // Two unrelated failure cycles, same attempt number, different fresh
+    // activity: the old bare `finalize-retry-{id}-{attempt}` id was identical
+    // for both, so QStash could suppress the second cycle's retry inside
+    // its dedup window and strand the listing.
+    const LATE2 = "2026-09-30T17:09:00.000Z";
+    await seedListing();
+    deps.gemini.extractListingImpl = async () => {
+      await deps.db.mutateListing("lst_1", (_doc) => ({
+        patch: { last_activity_at: LATE },
+        result: undefined,
+      }));
+      throw new GeminiError("extractListing: boom", true);
+    };
+    await handleFinalizePhotos(
+      { kind: "finalize-photos", listing_id: "lst_1", photo_at: NOW, activity_at: NOW, rearm: 1 },
+      fdeps,
+    );
+    // Second cycle: the listing's activity is now LATE, so the payload
+    // must carry LATE or the run skips as "rearmed".
+    deps.gemini.extractListingImpl = async () => {
+      await deps.db.mutateListing("lst_1", (_doc) => ({
+        patch: { last_activity_at: LATE2 },
+        result: undefined,
+      }));
+      throw new GeminiError("extractListing: boom", true);
+    };
+    await handleFinalizePhotos(
+      { kind: "finalize-photos", listing_id: "lst_1", photo_at: NOW, activity_at: LATE, rearm: 1 },
+      fdeps,
+    );
+    const retries = deps.enqueued.filter((e) => e.route === "finalize-photos");
+    expect(retries).toHaveLength(2);
+    const ids = retries.map((r) => r.opts?.deduplicationId);
+    expect(ids[0]).toBe(`finalize-retry-lst_1-1-${LATE}`);
+    expect(ids[1]).toBe(`finalize-retry-lst_1-1-${LATE2}`);
+    expect(ids[0]).not.toBe(ids[1]);
   });
 });
 
