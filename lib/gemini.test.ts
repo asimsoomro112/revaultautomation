@@ -204,6 +204,20 @@ describe("getGeminiClient.extractListing", () => {
     // Multimodal: images ride along as inlineData parts.
     expect(JSON.stringify(call)).toMatch(/inlineData/);
   });
+  it("tolerates a null confidence value instead of failing schema validation (Fix #38, 2026-11-24 live test)", async () => {
+    // gemini-3.6-flash returned confidence.measurements null and the whole
+    // extraction failed zod validation, failing the listing closed. A null
+    // confidence is a 0, not a reason to drop the extraction.
+    jsonReply({
+      ...visionJson,
+      extracted: { ...visionJson.extracted, confidence: { category: 0.9, measurements: null } },
+    });
+    const client = getGeminiClient();
+    const res = await client.extractListing([Buffer.from("img")], "chat text", "roman");
+    expect(res.extracted.category).toBe("blazer");
+    expect(res.extracted.confidence.measurements).toBe(0);
+    expect(res.extracted.confidence.category).toBeCloseTo(0.9);
+  });
   it("retries a transient 503 once, then succeeds", async () => {
     setExtractRetryDelays([0, 0]);
     // The retry budget IS the chain: a lone model gets one attempt, so the

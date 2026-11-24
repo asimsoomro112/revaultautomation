@@ -23,7 +23,7 @@
  */
 import { z } from "zod";
 import { log } from "./log";
-import { sanitizePhotoId } from "./db";
+import { photoStoragePath } from "./db";
 import type {
   ConversationDoc,
   IngestPayload,
@@ -191,8 +191,10 @@ async function handleImage(
   // Download bytes NOW — Meta CDN URLs expire, so this cannot wait. The
   // download happens OUTSIDE the transaction (no network I/O inside it);
   // the append below is the transactional part.
-  const photoId = sanitizePhotoId(message.mid);
-  const destPath = `raw/${listingId}/${photoId}.jpg`;
+  // Per-attachment path: one message's N attachments share one mid, so a
+  // bare-mid path would collide and photos 2+ would be skipped as
+  // "duplicate photo delivery" (see photoStoragePath, lib/db.ts).
+  const destPath = photoStoragePath(listingId, message.mid, message.image_url);
 
   // Idempotent append: a QStash retry re-running this ingest (same mid →
   // same storage_path) must not append the same photo twice — on 2026-11-23

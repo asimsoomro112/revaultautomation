@@ -110,7 +110,19 @@ const extractedZod = z.object({
   city: z.string().nullable(),
   defects: z.array(z.string()).default([]),
   measurements: z.string().nullable(),
-  confidence: z.record(z.string(), z.number().min(0).max(1)).default({}),
+  // Confidence values may be null: the model sometimes returns null for a
+  // field it has nothing to measure (2026-11-24 live burst test —
+  // gemini-3.6-flash returned confidence.measurements null and the whole
+  // extraction failed schema validation, failing the listing closed). A null
+  // confidence is a 0, not a reason to drop the extraction.
+  confidence: z
+    .record(z.string(), z.number().min(0).max(1).nullable())
+    .default({})
+    .transform((rec) => {
+      const out: Record<string, number> = {};
+      for (const [k, v] of Object.entries(rec)) out[k] = v ?? 0;
+      return out;
+    }),
 });
 
 const perImageZod = z.object({

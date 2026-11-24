@@ -18,7 +18,7 @@
 import { cert, getApps, initializeApp, type App } from "firebase-admin/app";
 import { getFirestore, type Firestore } from "firebase-admin/firestore";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { getEnv, requireFirebaseEnv, type Env } from "./env";
 import type { AdminSettings, ConversationDoc, DeepPartial, ListingDoc, NormalizedInbound } from "./types";
 
@@ -66,6 +66,23 @@ export function newListingId(): string {
 /** Sanitize a Meta mid into a safe Storage filename segment. */
 export function sanitizePhotoId(mid: string): string {
   return mid.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 64);
+}
+
+/**
+ * Per-attachment storage path for a photo. One message carrying N image
+ * attachments fans out to N inbounds that ALL share one `mid`
+ * (see lib/webhook.ts `inboundDedupId` / parseMessage). Keying the path on
+ * the bare mid made photos 2+ collide with photo 1's path and get skipped
+ * as "duplicate photo delivery" — 2026-11-24 live burst test: 3 photos
+ * sent, only 1 saved, the other two logged `ingest: duplicate photo
+ * delivery skipped`. Include a short SHA-256 of the CDN URL (the same
+ * discriminator Fix #21 used for the QStash dedup id) so each attachment
+ * gets its own path; a genuine redelivery (same mid + same URL) still maps
+ * to the same path and stays idempotent.
+ */
+export function photoStoragePath(listingId: string, mid: string, imageUrl: string): string {
+  const hash = createHash("sha256").update(imageUrl).digest("hex").slice(0, 16);
+  return `raw/${listingId}/${sanitizePhotoId(mid)}-${hash}.jpg`;
 }
 
 /** yyyy-MM-dd in Asia/Karachi (no DST in PKT). */
