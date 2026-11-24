@@ -558,6 +558,56 @@ describe("handleMessage: consent", () => {
     expect(listing.status).toBe("CONFIRM");
   });
 
+  it("late consent:cancel after Post → no cancel reply, listing stays SUBMITTED", async () => {
+    await seedConfirm();
+    await handleMessage(
+      payload("mid_9"),
+      makeInbound("quick_reply", "mid_9", { quick_reply_payload: "consent:post", text: "Post it" }),
+      deps,
+    );
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("SUBMITTED");
+    const sentBefore = deps.meta.sent.length;
+    await handleMessage(
+      payload("mid_11"),
+      makeInbound("quick_reply", "mid_11", { quick_reply_payload: "consent:cancel", text: "Cancel" }),
+      deps,
+    );
+    // Old code: the cancel tap cleared the convo and sent cancelReply
+    // ("Listing cancel kar di hai") even though nothing was cancelled —
+    // the seller was told the listing was cancelled while publish proceeded.
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("SUBMITTED");
+    expect(deps.meta.sent.length).toBe(sentBefore);
+    expect(deps.meta.sent.some((s) => /cancel|منسوخ/i.test(s.opts.text ?? ""))).toBe(false);
+  });
+
+  it("consent:cancel during the photo-check hold → pointer kept, no cancel reply", async () => {
+    const convo = await deps.db.getOrCreateConversation(IGSID);
+    const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
+    listing.status = "NEEDS_INFO";
+    listing.extracted = fullTestExtracted();
+    listing.photos = [
+      makePhoto("sellers/x/0.jpg"),
+      { storage_path: "sellers/x/1.jpg", w: 800, h: 1000, phash: "", received_at: NOW },
+    ];
+    listing.missing = [];
+    await deps.db.createListing(listing);
+    convo.state = "NEEDS_INFO";
+    convo.active_listing_id = "lst_1";
+    convo.last_user_msg_at = NOW;
+    const sentBefore = deps.meta.sent.length;
+    await handleMessage(
+      payload("mid_11"),
+      makeInbound("quick_reply", "mid_11", { quick_reply_payload: "consent:cancel", text: "Cancel" }),
+      deps,
+    );
+    // The listing was NOT cancelled — the pointer must survive so the
+    // re-armed finalize's moveToConfirm can still reach the seller.
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("NEEDS_INFO");
+    expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
+    expect(deps.fdb.convos.get(IGSID)!.active_listing_id).toBe("lst_1");
+    expect(deps.meta.sent.length).toBe(sentBefore);
+  });
+
   it("CONFIRM + stray text → nudge with consent buttons (no state change)", async () => {
     await seedConfirm();
     await handleMessage(payload("mid_9"), makeInbound("text", "mid_9", { text: "hmm" }), deps);

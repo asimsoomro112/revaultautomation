@@ -1020,11 +1020,20 @@ async function handleConsentCancel(deps: Deps, convo: ConversationDoc): Promise<
     await deps.db.saveListing(listing.id, { status: "REJECTED" });
     listing.status = "REJECTED";
     await deps.db.appendListingEvent(listing.id, { type: "cancelled_by_seller" });
+    setConversationState(convo, "IDLE");
+    convo.active_listing_id = null;
+    await persistConvo(deps, convo);
+    await sendSafe(deps, convo, { text: cancelReply(convo.lang) });
+    return;
   }
-  setConversationState(convo, "IDLE");
-  convo.active_listing_id = null;
+  // Stale tap — the listing was NOT cancelled (already submitted, or
+  // deferred for the photo check): do not clear the pointer or tell the
+  // seller it was cancelled. Clearing active_listing_id here would strand
+  // the listing (moveToConfirm never restores it, so a later "Post it" is
+  // silently ignored), and the cancel DM would lie while publish proceeds
+  // (2026-11-24 re-audit Lane C NEW-7 / pass-3 NEW-A). Silently ignore,
+  // like the other stale consent taps.
   await persistConvo(deps, convo);
-  await sendSafe(deps, convo, { text: cancelReply(convo.lang) });
 }
 
 async function handleConsentEdit(deps: Deps, convo: ConversationDoc): Promise<void> {
