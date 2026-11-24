@@ -14,10 +14,18 @@ import { enqueueWorker } from "./qstash";
 
 export async function enqueuePublishWorker(listingId: string): Promise<boolean> {
   try {
+    // One dedup id per admin action, not per listing: a static
+    // `admin-publish:{id}` is silently dropped by QStash when a genuine
+    // second action for the same listing lands inside the dedup window
+    // (approve → QStash 502 → rollback → approve again), stranding the
+    // listing with no worker while the API reports success. The status
+    // guards (approve rejects APPROVED, retry requires FAILED) already
+    // block true double-click duplicates, so the id must vary per action
+    // (2026-11-24 re-audit pass 2, Lane B NEW-2).
     await enqueueWorker(
       "publish",
       { kind: "publish", listing_id: listingId },
-      { deduplicationId: `admin-publish:${listingId}` },
+      { deduplicationId: `admin-publish:${listingId}:${Date.now()}` },
     );
     return true;
   } catch (err) {
