@@ -63,7 +63,16 @@ export interface QueueItem {
   missing: string[];
   photo_count: number;
   photo_urls: string[];
-  publish: { slot_at: string | null; permalink: string | null; attempts: number; last_error: string | null };
+  publish: {
+    slot_at: string | null;
+    permalink: string | null;
+    /** IG media id once the post is live; non-null blocks approve/retry/reject. */
+    media_id: string | null;
+    /** True when media_id is set on a FAILED/REJECTED listing (live post, terminal listing). */
+    published_terminal: boolean;
+    attempts: number;
+    last_error: string | null;
+  };
 }
 
 export interface PublishLogRow {
@@ -105,6 +114,10 @@ export interface ActivityItem {
   /** Set on finalize_retry events: the transient error that scheduled the retry. */
   error?: string | null;
   attempt?: number | null;
+  /** Set on published_terminal events: the live IG media id. */
+  media_id?: string | null;
+  /** Set on published_terminal events: the terminal listing status. */
+  listing_status?: string | null;
 }
 
 export interface BannedSeller {

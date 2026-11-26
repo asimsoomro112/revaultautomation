@@ -8,7 +8,9 @@ import styles from "../styles.module.css";
 function eventBadgeClass(type: string): string {
   const key = `badge${type}` as keyof typeof styles;
   if (type === "approved" || type === "published") return `${styles.badge} ${styles.badgeAPPROVED ?? ""}`;
-  if (type === "rejected" || type === "publish_failed") return `${styles.badge} ${styles.badgeFAILED ?? ""}`;
+  // published_terminal = post live on IG but listing terminal — needs a human.
+  if (type === "rejected" || type === "publish_failed" || type === "published_terminal")
+    return `${styles.badge} ${styles.badgeFAILED ?? ""}`;
   return `${styles.badge} ${styles[key] ?? ""}`;
 }
 
@@ -75,6 +77,8 @@ export default function ActivityFeed() {
                     {it.detail ?? "—"}
                     {typeof it.photo_count === "number" ? ` · ${it.photo_count} photos` : ""}
                     {it.error ? ` · ${it.error}` : ""}
+                    {it.media_id ? ` · live media ${it.media_id}` : ""}
+                    {it.listing_status ? ` · listing ${it.listing_status}` : ""}
                   </td>
                 </tr>
               ))}

@@ -39,6 +39,10 @@ function ListingCard({
 
   const ex = item.extracted;
   const mod = item.moderation;
+  // A listing with media_id is already live on IG — even in FAILED
+  // (published_terminal). Approve/retry/reject/caption are blocked
+  // server-side; disable them here too so the admin sees why (HIGH #2).
+  const liveOnInstagram = Boolean(item.publish.media_id);
 
   return (
     <div className={styles.card}>
@@ -93,6 +97,23 @@ function ListingCard({
       {item.publish.last_error && (
         <div className={styles.error}>Last error: {item.publish.last_error}</div>
       )}
+      {liveOnInstagram && (
+        <div className={styles.alert}>
+          Live on Instagram
+          {item.publish.published_terminal
+            ? " — this listing is terminal, so approve, retry and reject are disabled"
+            : ""}
+          . Media ID: {item.publish.media_id}
+          {item.publish.permalink ? (
+            <>
+              {" · "}
+              <a href={item.publish.permalink} target="_blank" rel="noreferrer">
+                View post
+              </a>
+            </>
+          ) : null}
+        </div>
+      )}
       {item.publish.slot_at && (
         <div className={styles.muted}>Slot: {new Date(item.publish.slot_at).toLocaleString()}</div>
       )}
@@ -102,12 +123,13 @@ function ListingCard({
         value={caption}
         onChange={(e) => setCaption(e.target.value)}
         placeholder="Caption (editable)"
+        disabled={liveOnInstagram}
       />
 
       <div className={styles.btnRow}>
         <button
           className={`${styles.btn} ${styles.btnApprove}`}
-          disabled={busy !== null}
+          disabled={busy !== null || liveOnInstagram}
           onClick={() =>
             run("approve", () => post(`/listings/${item.id}/approve`, {}))
           }
@@ -116,7 +138,7 @@ function ListingCard({
         </button>
         <button
           className={styles.btn}
-          disabled={busy !== null}
+          disabled={busy !== null || liveOnInstagram}
           onClick={() =>
             run("caption", () => post(`/listings/${item.id}/caption`, { caption }))
           }
@@ -125,7 +147,7 @@ function ListingCard({
         </button>
         <button
           className={`${styles.btn} ${styles.btnReject}`}
-          disabled={busy !== null}
+          disabled={busy !== null || liveOnInstagram}
           onClick={() => {
             const reason = window.prompt("Rejection reason (shown to seller):");
             if (reason) run("reject", () => post(`/listings/${item.id}/reject`, { reason }));
@@ -133,7 +155,7 @@ function ListingCard({
         >
           Reject
         </button>
-        {item.status === "FAILED" && (
+        {item.status === "FAILED" && !liveOnInstagram && (
           <button
             className={`${styles.btn} ${styles.btnPrimary}`}
             disabled={busy !== null}

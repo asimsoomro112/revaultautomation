@@ -1,11 +1,18 @@
 /**
  * Vercel Cron: publish-pipeline reconciliation — GET /api/cron/reconcile
- * Schedule (vercel.json): every 6 hours at minute 0 UTC = 05:00 / 11:00 / 17:00 / 23:00 PKT.
+ * Schedule (vercel.json): daily 04:00 UTC = 09:00 PKT.
  *
  * Cheap insurance: any listing stuck in PUBLISHING with no worker activity for
  * > 2h is marked FAILED (with last_error) and the admin is alerted on
  * Telegram. The admin can retry from /admin — retry reuses the idempotency
  * record, so a stuck worker that later wakes up cannot double-post.
+ *
+ * Guards (2026-11-24 audit HIGH #3): a listing is only failed when it is
+ * still PUBLISHING, has no media_id, and holds no live claim lease — all
+ * re-checked inside a Firestore transaction together with the latest
+ * audit event, so a worker that wakes up mid-reconcile is never failed
+ * underneath itself. A media_id listing (post live on IG) with an expired
+ * lease is handed to the publish worker's permalink recovery instead.
  *
  * LIMITATION (documented, per plan §16): the "proper" reconciliation would
  * list recent Instagram conversations and diff them against processed mids,
@@ -22,15 +29,17 @@ import { NextRequest, NextResponse } from "next/server";
 import { isCronAuthorized } from "@/lib/cron-auth";
 import { adminDb, appendListingEvent } from "@/lib/firebase-admin";
 import { log } from "@/lib/log";
+import { enqueuePublishWorker } from "@/lib/publish-queue";
+import { reconcileDecision, STUCK_AFTER_MS, type ReconcileDecision } from "@/lib/reconcile";
 import { notifyAdmin } from "@/lib/telegram";
-
-const STUCK_AFTER_MS = 2 * 3600 * 1000;
+import type { ListingDoc } from "@/lib/types";
 
 export async function GET(req: NextRequest) {
   if (!isCronAuthorized(req)) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
-  const stuckBefore = new Date(Date.now() - STUCK_AFTER_MS).toISOString();
+  const now = new Date();
+  const stuckBefore = new Date(now.getTime() - STUCK_AFTER_MS).toISOString();
   const snap = await adminDb()
     .collection("listings")
     .where("status", "==", "PUBLISHING")
@@ -38,27 +47,70 @@ export async function GET(req: NextRequest) {
     .get();
 
   const recovered: string[] = [];
-  for (const doc of snap.docs) {
-    // Confirm no recent worker activity via the latest audit event.
-    let lastActivity: string | null = null;
-    try {
-      const ev = await doc.ref.collection("events").orderBy("at", "desc").limit(1).get();
-      lastActivity = (ev.docs[0]?.data()?.at as string | undefined) ?? null;
-    } catch {
-      lastActivity = null;
-    }
-    const anchor = lastActivity ?? (doc.data()?.created_at as string | undefined) ?? "";
-    if (anchor >= stuckBefore) continue; // active recently — leave it alone
+  const liveMedia: string[] = [];
+  const recoveryEnqueued: string[] = [];
+  const skippedLease: string[] = [];
 
-    await doc.ref.update({
-      status: "FAILED",
-      "publish.last_error": "reconcile: stuck in PUBLISHING > 2h with no worker activity",
+  for (const doc of snap.docs) {
+    // One transaction per candidate: re-read the listing AND its latest
+    // audit event, decide on the fresh state, and only then write. A
+    // worker claim (lease/status/media_id change) landing between the
+    // query above and this write therefore wins instead of being failed.
+    const decision = await adminDb().runTransaction<ReconcileDecision>(async (tx) => {
+      const freshSnap = await tx.get(doc.ref);
+      if (!freshSnap.exists) return "skip-not-publishing";
+      const fresh = freshSnap.data() as ListingDoc;
+      let lastActivity: string | null = null;
+      try {
+        const ev = await tx.get(doc.ref.collection("events").orderBy("at", "desc").limit(1));
+        lastActivity = (ev.docs[0]?.data()?.at as string | undefined) ?? null;
+      } catch {
+        lastActivity = null;
+      }
+      const d = reconcileDecision(
+        {
+          status: fresh.status,
+          created_at: fresh.created_at,
+          publish: fresh.publish,
+          lastActivity,
+        },
+        now.getTime(),
+      );
+      if (d === "fail") {
+        tx.update(doc.ref, {
+          status: "FAILED",
+          "publish.last_error": "reconcile: stuck in PUBLISHING > 2h with no worker activity",
+        });
+      }
+      return d;
     });
-    await appendListingEvent(doc.id, "publish_failed", {
-      detail: "Reconcile cron: stuck in PUBLISHING > 2h → FAILED",
-    });
-    recovered.push(doc.id);
-    log.warn("cron/reconcile: stuck listing marked FAILED", { listing: doc.id });
+
+    if (decision === "fail") {
+      await appendListingEvent(doc.id, "publish_failed", {
+        detail: "Reconcile cron: stuck in PUBLISHING > 2h → FAILED",
+      });
+      recovered.push(doc.id);
+      log.warn("cron/reconcile: stuck listing marked FAILED", { listing: doc.id });
+    } else if (decision === "recover-live-media" || decision === "skip-live-media") {
+      liveMedia.push(doc.id);
+      if (decision === "recover-live-media") {
+        // Post is live but the listing never reached PUBLISHED: the
+        // publish worker's media_id path recovers the permalink without
+        // calling media_publish again.
+        const enqueued = await enqueuePublishWorker(doc.id);
+        if (enqueued) {
+          recoveryEnqueued.push(doc.id);
+        } else {
+          log.warn("cron/reconcile: live-media recovery enqueue failed", { listing: doc.id });
+        }
+      }
+      log.info("cron/reconcile: live-media listing left for recovery", {
+        listing: doc.id,
+        decision,
+      });
+    } else if (decision === "skip-lease") {
+      skippedLease.push(doc.id);
+    }
   }
 
   if (recovered.length > 0) {
@@ -71,6 +123,9 @@ export async function GET(req: NextRequest) {
     ok: true,
     checked: snap.size,
     recovered,
+    live_media: liveMedia,
+    recovery_enqueued: recoveryEnqueued,
+    skipped_lease: skippedLease,
     note: "DM-vs-webhook diff skipped: Conversations API read needs extra scopes (documented limitation).",
   });
 }

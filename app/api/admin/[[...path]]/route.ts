@@ -132,6 +132,14 @@ function listingSummary(d: { id: string; data: () => unknown }) {
     publish: {
       slot_at: data.publish.slot_at,
       permalink: data.publish.permalink,
+      media_id: data.publish.media_id,
+      // media_id set on a terminal listing means the post is live on IG
+      // but the listing never reached PUBLISHED (worker wrote a
+      // published_terminal event). Surface it so an admin cannot reject
+      // or retry a live post by mistake (2026-11-24 audit HIGH #2).
+      published_terminal:
+        Boolean(data.publish.media_id) &&
+        (data.status === "FAILED" || data.status === "REJECTED"),
       attempts: data.publish.attempts,
       last_error: data.publish.last_error,
     },
@@ -186,6 +194,66 @@ async function killSwitchBlock(): Promise<NextResponse | null> {
         { status: 409 },
       )
     : null;
+}
+
+type ListingTransition<T> =
+  | { found: false }
+  | { found: true; doc: ListingDoc; result: T };
+
+/**
+ * Run one admin listing transition inside a Firestore transaction.
+ *
+ * The mutator receives the FRESH doc (re-read inside the transaction) and
+ * returns the patch to apply — or no patch when the fresh state no longer
+ * allows the action. This closes the admin TOCTOU race (2026-11-24 audit
+ * HIGH #1): the old get → check → plain update let a stale approve/retry
+ * overwrite a concurrent reject (or a worker transition), resurrecting a
+ * terminal listing. With the check inside the transaction, exactly one
+ * writer wins and the loser sees the winner's state.
+ */
+async function transitionListing<T>(
+  id: string,
+  mutate: (doc: ListingDoc) => { patch?: Record<string, unknown>; result: T },
+): Promise<ListingTransition<T>> {
+  const ref = adminDb().collection("listings").doc(id);
+  return adminDb().runTransaction(async (tx) => {
+    const snap = await tx.get(ref);
+    if (!snap.exists) return { found: false };
+    const doc = snap.data() as ListingDoc;
+    const { patch, result } = mutate(doc);
+    if (patch) tx.update(ref, patch);
+    return { found: true, doc, result };
+  });
+}
+
+type ApproveTransition =
+  | { kind: "live-media"; mediaId: string }
+  | { kind: "conflict"; status: ListingStatus }
+  | { kind: "applied"; previousStatus: ListingStatus; previousReview: ListingDoc["review"] };
+
+type RejectTransition =
+  | { kind: "live-media"; mediaId: string }
+  | { kind: "conflict"; status: ListingStatus }
+  | { kind: "applied"; sellerIgsid: string };
+
+type CaptionTransition =
+  | { kind: "live-media"; mediaId: string }
+  | { kind: "conflict"; status: ListingStatus }
+  | { kind: "applied" };
+
+type RetryTransition =
+  | { kind: "live-media"; mediaId: string }
+  | { kind: "conflict"; status: ListingStatus }
+  | { kind: "applied"; prevError: string | null };
+
+/** 409 for actions on a listing whose post is already live on Instagram. */
+function liveMediaConflict(action: string, mediaId: string): NextResponse {
+  return NextResponse.json(
+    {
+      error: `Cannot ${action} this listing: its post is already live on Instagram (media_id ${mediaId}). Use the Instagram delete flow if it must come down.`,
+    },
+    { status: 409 },
+  );
 }
 
 // --- route handlers --------------------------------------------------------
@@ -338,6 +406,8 @@ async function handleGet(path: string[]) {
             photo_count?: number;
             error?: string;
             attempt?: number;
+            media_id?: string;
+            status?: string;
           };
           return {
             id: e.id,
@@ -349,6 +419,11 @@ async function handleGet(path: string[]) {
             photo_count: typeof data.photo_count === "number" ? data.photo_count : null,
             error: typeof data.error === "string" ? data.error : null,
             attempt: typeof data.attempt === "number" ? data.attempt : null,
+            // published_terminal events carry the live media id + the
+            // terminal listing status — surface both so the feed shows
+            // that a post is live on IG (HIGH #2).
+            media_id: typeof data.media_id === "string" ? data.media_id : null,
+            listing_status: typeof data.status === "string" ? data.status : null,
           };
         });
       }),
@@ -427,6 +502,7 @@ async function handlePost(
     const snap = await ref.get();
     if (!snap.exists) return NextResponse.json({ error: "Listing not found" }, { status: 404 });
     const data = snap.data() as ListingDoc;
+    if (data.publish?.media_id) return liveMediaConflict("approve", data.publish.media_id);
     if (!["NEEDS_REVIEW", "SUBMITTED", "FAILED", "QUEUED"].includes(data.status)) {
       return NextResponse.json(
         { error: `Cannot approve a listing in status ${data.status}` },
@@ -435,30 +511,83 @@ async function handlePost(
     }
     const blocked = await killSwitchBlock();
     if (blocked) return blocked;
-    await ref.update({
-      status: "APPROVED",
-      review: { note: null, decided_by: by, decided_at: new Date().toISOString() },
+    // Atomic transition: re-validate status + media_id on the fresh doc
+    // inside the transaction, so a concurrent reject/worker move between
+    // the read above and this write cannot be overwritten (HIGH #1).
+    const decidedAt = new Date().toISOString();
+    const transition = await transitionListing<ApproveTransition>(b, (doc) => {
+      if (doc.publish?.media_id) {
+        return { result: { kind: "live-media" as const, mediaId: doc.publish.media_id } };
+      }
+      if (!["NEEDS_REVIEW", "SUBMITTED", "FAILED", "QUEUED"].includes(doc.status)) {
+        return { result: { kind: "conflict" as const, status: doc.status } };
+      }
+      return {
+        patch: {
+          status: "APPROVED",
+          review: { note: null, decided_by: by, decided_at: decidedAt },
+        },
+        result: {
+          kind: "applied" as const,
+          previousStatus: doc.status,
+          previousReview: doc.review ?? { note: null, decided_by: null, decided_at: null },
+        },
+      };
     });
+    if (!transition.found) return NextResponse.json({ error: "Listing not found" }, { status: 404 });
+    if (transition.result.kind === "live-media") {
+      return liveMediaConflict("approve", transition.result.mediaId);
+    }
+    if (transition.result.kind === "conflict") {
+      return NextResponse.json(
+        { error: `Cannot approve a listing in status ${transition.result.status}` },
+        { status: 409 },
+      );
+    }
+    const { previousStatus, previousReview } = transition.result;
     await appendListingEvent(b, "approved", { by, detail: "Approved in /admin" });
     const enqueued = await enqueuePublishWorker(b);
     if (!enqueued) {
       // The worker was never enqueued: roll the listing back to its
       // pre-approve status so the admin can approve again — otherwise it
       // would strand in APPROVED with no UI path to re-enqueue (approve
-      // rejects APPROVED, retry requires FAILED).
-      await ref.update({
-        status: data.status,
-        review: data.review ?? { note: null, decided_by: null, decided_at: null },
+      // rejects APPROVED, retry requires FAILED). The rollback is itself
+      // conditional: it only applies while the listing is still in THIS
+      // approve's APPROVED state (same decider + timestamp), so a
+      // concurrent reject or worker claim during the enqueue is never
+      // overwritten by the rollback (HIGH #1, rollback leg).
+      const rollback = await transitionListing(b, (doc) => {
+        if (
+          doc.status === "APPROVED" &&
+          doc.review?.decided_by === by &&
+          doc.review?.decided_at === decidedAt
+        ) {
+          return {
+            patch: { status: previousStatus, review: previousReview },
+            result: true,
+          };
+        }
+        return { result: false };
       });
+      const rolledBack = rollback.found && rollback.result;
+      const leftIn = rolledBack
+        ? previousStatus
+        : rollback.found
+          ? rollback.doc.status
+          : previousStatus;
       await appendListingEvent(b, "approve_enqueue_failed", {
         by,
-        detail: `Publish worker could not be enqueued (QStash) — listing left in ${data.status}`,
+        detail: rolledBack
+          ? `Publish worker could not be enqueued (QStash) — listing left in ${previousStatus}`
+          : `Publish worker could not be enqueued (QStash) — listing changed concurrently and was left in ${leftIn}`,
       });
-      log.warn("admin-api: approve enqueue failed, rolled back", { listing: b, by, from: data.status });
+      log.warn("admin-api: approve enqueue failed", { listing: b, by, from: previousStatus, rolledBack, leftIn });
       return NextResponse.json(
         {
           ok: false,
-          error: `Publish worker could not be enqueued (QStash) — listing left in ${data.status}; try again`,
+          error: rolledBack
+            ? `Publish worker could not be enqueued (QStash) — listing left in ${previousStatus}; try again`
+            : `Publish worker could not be enqueued (QStash) — listing changed concurrently and was left in ${leftIn}; refresh and try again`,
         },
         { status: 502 },
       );
@@ -477,6 +606,10 @@ async function handlePost(
     const snap = await ref.get();
     if (!snap.exists) return NextResponse.json({ error: "Listing not found" }, { status: 404 });
     const data = snap.data() as ListingDoc;
+    // A listing with media_id is already live on IG even when its status
+    // is FAILED (published_terminal): rejecting it would mark a live post
+    // REJECTED and retention would delete its originals (HIGH #2).
+    if (data.publish?.media_id) return liveMediaConflict("reject", data.publish.media_id);
     // A PUBLISHING listing is mid-flight (containers created or
     // media_publish in progress): rejecting it here would not stop the
     // workers — the listing would end FAILED, not REJECTED, and the
@@ -488,13 +621,36 @@ async function handlePost(
         { status: 409 },
       );
     }
-    await ref.update({
-      status: "REJECTED",
-      review: { note: parsed.data.reason, decided_by: by, decided_at: new Date().toISOString() },
+    // Atomic transition (HIGH #1): re-validate on the fresh doc so a
+    // concurrent approve/worker move cannot be overwritten by this reject.
+    const transition = await transitionListing<RejectTransition>(b, (doc) => {
+      if (doc.publish?.media_id) {
+        return { result: { kind: "live-media" as const, mediaId: doc.publish.media_id } };
+      }
+      if (["PUBLISHING", "PUBLISHED", "REJECTED"].includes(doc.status)) {
+        return { result: { kind: "conflict" as const, status: doc.status } };
+      }
+      return {
+        patch: {
+          status: "REJECTED",
+          review: { note: parsed.data.reason, decided_by: by, decided_at: new Date().toISOString() },
+        },
+        result: { kind: "applied" as const, sellerIgsid: doc.seller_igsid },
+      };
     });
+    if (!transition.found) return NextResponse.json({ error: "Listing not found" }, { status: 404 });
+    if (transition.result.kind === "live-media") {
+      return liveMediaConflict("reject", transition.result.mediaId);
+    }
+    if (transition.result.kind === "conflict") {
+      return NextResponse.json(
+        { error: `Cannot reject a listing in status ${transition.result.status}` },
+        { status: 409 },
+      );
+    }
     await appendListingEvent(b, "rejected", { by, detail: parsed.data.reason });
     await tryNotifySeller(
-      data.seller_igsid,
+      transition.result.sellerIgsid,
       `Assalam-o-Alaikum! Apki listing review ke baad post nahi ki ja sakti. Wajah: ${parsed.data.reason}. Koi aur item bhejna chahein to zaroor bhejiye ga! — Team ReVault`,
     );
     log.info("admin-api: listing rejected", { listing: b, by });
@@ -511,6 +667,7 @@ async function handlePost(
     const snap = await ref.get();
     if (!snap.exists) return NextResponse.json({ error: "Listing not found" }, { status: 404 });
     const data = snap.data() as ListingDoc;
+    if (data.publish?.media_id) return liveMediaConflict("edit the caption of", data.publish.media_id);
     // The caption is baked into the IG containers at publish time: editing
     // a PUBLISHING listing's caption would be silently lost (containers
     // already carry the old one), and a PUBLISHED listing's caption lives
@@ -523,7 +680,27 @@ async function handlePost(
         { status: 409 },
       );
     }
-    await ref.update({ caption: parsed.data.caption });
+    // Conditional write (HIGH #1 pattern): re-validate on the fresh doc so
+    // a caption edit cannot land after a concurrent move to PUBLISHING.
+    const transition = await transitionListing<CaptionTransition>(b, (doc) => {
+      if (doc.publish?.media_id) {
+        return { result: { kind: "live-media" as const, mediaId: doc.publish.media_id } };
+      }
+      if (!["NEEDS_REVIEW", "CONFIRM", "SUBMITTED", "QUEUED", "APPROVED", "FAILED"].includes(doc.status)) {
+        return { result: { kind: "conflict" as const, status: doc.status } };
+      }
+      return { patch: { caption: parsed.data.caption }, result: { kind: "applied" as const } };
+    });
+    if (!transition.found) return NextResponse.json({ error: "Listing not found" }, { status: 404 });
+    if (transition.result.kind === "live-media") {
+      return liveMediaConflict("edit the caption of", transition.result.mediaId);
+    }
+    if (transition.result.kind === "conflict") {
+      return NextResponse.json(
+        { error: `Cannot edit the caption of a listing in status ${transition.result.status}` },
+        { status: 409 },
+      );
+    }
     await appendListingEvent(b, "caption_edited", { by, detail: "Caption edited in /admin" });
     return NextResponse.json({ ok: true });
   }
@@ -534,6 +711,7 @@ async function handlePost(
     const snap = await ref.get();
     if (!snap.exists) return NextResponse.json({ error: "Listing not found" }, { status: 404 });
     const data = snap.data() as ListingDoc;
+    if (data.publish?.media_id) return liveMediaConflict("retry", data.publish.media_id);
     if (data.status !== "FAILED") {
       return NextResponse.json(
         { error: `Only FAILED listings can be retried (current: ${data.status})` },
@@ -542,26 +720,65 @@ async function handlePost(
     }
     const blocked = await killSwitchBlock();
     if (blocked) return blocked;
-    // Keep the original failure reason: the rollback below restores it, or
-    // the retry's own failure would erase the only record of why the
-    // listing FAILED in the first place (Fix #10 gap, 2026-11-24 re-audit).
-    const prevError = data.publish?.last_error ?? null;
-    await ref.update({ status: "QUEUED", "publish.last_error": null });
+    // Atomic transition (HIGH #1): re-validate FAILED + no media_id on the
+    // fresh doc. Keep the original failure reason from the SAME fresh doc:
+    // the rollback below restores it, or the retry's own failure would
+    // erase the only record of why the listing FAILED (Fix #10 gap).
+    const transition = await transitionListing<RetryTransition>(b, (doc) => {
+      if (doc.publish?.media_id) {
+        return { result: { kind: "live-media" as const, mediaId: doc.publish.media_id } };
+      }
+      if (doc.status !== "FAILED") {
+        return { result: { kind: "conflict" as const, status: doc.status } };
+      }
+      return {
+        patch: { status: "QUEUED", "publish.last_error": null },
+        result: { kind: "applied" as const, prevError: doc.publish?.last_error ?? null },
+      };
+    });
+    if (!transition.found) return NextResponse.json({ error: "Listing not found" }, { status: 404 });
+    if (transition.result.kind === "live-media") {
+      return liveMediaConflict("retry", transition.result.mediaId);
+    }
+    if (transition.result.kind === "conflict") {
+      return NextResponse.json(
+        { error: `Only FAILED listings can be retried (current: ${transition.result.status})` },
+        { status: 409 },
+      );
+    }
+    const prevError = transition.result.prevError;
     await appendListingEvent(b, "retry", { by, detail: "Re-queued from /admin" });
     const enqueued = await enqueuePublishWorker(b);
     if (!enqueued) {
       // Same strand as approve: a QUEUED listing with no worker enqueued
-      // would never publish. Roll back to FAILED so the admin can retry.
-      await ref.update({ status: "FAILED", "publish.last_error": prevError });
+      // would never publish. Roll back to FAILED so the admin can retry —
+      // conditionally, only while the listing is still in this retry's
+      // QUEUED state (last_error still cleared), so a concurrent reject or
+      // worker move during the enqueue is never overwritten (HIGH #1).
+      const rollback = await transitionListing(b, (doc) => {
+        if (doc.status === "QUEUED" && (doc.publish?.last_error ?? null) === null) {
+          return {
+            patch: { status: "FAILED", "publish.last_error": prevError },
+            result: true,
+          };
+        }
+        return { result: false };
+      });
+      const rolledBack = rollback.found && rollback.result;
+      const leftIn = rolledBack ? "FAILED" : rollback.found ? rollback.doc.status : "FAILED";
       await appendListingEvent(b, "retry_enqueue_failed", {
         by,
-        detail: "Publish worker could not be enqueued (QStash) — listing left in FAILED",
+        detail: rolledBack
+          ? "Publish worker could not be enqueued (QStash) — listing left in FAILED"
+          : `Publish worker could not be enqueued (QStash) — listing changed concurrently and was left in ${leftIn}`,
       });
-      log.warn("admin-api: retry enqueue failed, rolled back", { listing: b, by });
+      log.warn("admin-api: retry enqueue failed", { listing: b, by, rolledBack, leftIn });
       return NextResponse.json(
         {
           ok: false,
-          error: "Publish worker could not be enqueued (QStash) — listing left in FAILED; try again",
+          error: rolledBack
+            ? "Publish worker could not be enqueued (QStash) — listing left in FAILED; try again"
+            : `Publish worker could not be enqueued (QStash) — listing changed concurrently and was left in ${leftIn}; refresh and try again`,
         },
         { status: 502 },
       );

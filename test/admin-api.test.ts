@@ -42,7 +42,7 @@ const mocks = vi.hoisted(() => {
     events: [] as Array<{
       id: string;
       listingId: string;
-      data: { type: string; at: string; by?: string | null; detail?: string | null; photo_count?: number; error?: string; attempt?: number };
+      data: { type: string; at: string; by?: string | null; detail?: string | null; photo_count?: number; error?: string; attempt?: number; media_id?: string; status?: string };
     }>,
     getAdminSettings: vi.fn(async () => settings),
     updateAdminSettings: vi.fn(async (patch: Record<string, unknown>) => {
@@ -82,7 +82,85 @@ vi.mock("@/lib/firebase-admin", () => {
       }),
     };
   }
+  // Listing patch application shared by doc().update and the fake
+  // transaction: Firestore update() applies dotted keys
+  // ("publish.last_error") as nested sets — the fake must too, or a test
+  // asserting on the nested field would pass while prod loses the value.
+  function applyListingPatch(id: string, patch: Record<string, unknown>) {
+    const cur = mocks.listingById.get(id);
+    if (!cur) throw new Error(`fakeDb listings doc(${id}) missing`);
+    const next: Record<string, unknown> = { ...cur };
+    for (const [key, value] of Object.entries(patch)) {
+      const parts = key.split(".");
+      if (parts.length === 1) {
+        next[key] = value;
+        continue;
+      }
+      let target = next;
+      for (let i = 0; i < parts.length - 1; i++) {
+        const p = parts[i]!;
+        const existing = target[p];
+        const obj =
+          existing && typeof existing === "object" && !Array.isArray(existing)
+            ? { ...(existing as Record<string, unknown>) }
+            : {};
+        target[p] = obj;
+        target = obj;
+      }
+      target[parts[parts.length - 1]!] = value;
+    }
+    mocks.listingById.set(id, next);
+  }
+  function makeListingRef(id: string) {
+    return {
+      id,
+      path: `listings/${id}`,
+      get: async () => ({
+        exists: mocks.listingById.has(id),
+        data: () => mocks.listingById.get(id),
+        ref: makeListingRef(id),
+      }),
+      update: async (patch: Record<string, unknown>) => applyListingPatch(id, patch),
+      collection: (sub: string) => {
+        if (sub !== "events") throw new Error(`fakeDb listings ref.collection(${sub}) not stubbed`);
+        return orderLimitGet(
+          mocks.events
+            .filter((e) => e.listingId === id)
+            .map((e) => ({ id: e.id, data: () => e.data })),
+          (d) => (d.data() as { at: string }).at,
+        );
+      },
+    };
+  }
+  // Fake Firestore transaction: serialized per fakeDb (Firestore serializes
+  // conflicting transactions), tx.get reads the CURRENT stored doc, and
+  // tx.update applies through applyListingPatch. This is what lets the
+  // TOCTOU tests prove a stale admin action cannot overwrite a winner.
+  let txChain: Promise<unknown> = Promise.resolve();
+  const fakeTx = {
+    get: async (ref: { id: string }) => ({
+      exists: mocks.listingById.has(ref.id),
+      data: () => mocks.listingById.get(ref.id),
+      ref,
+    }),
+    update: (ref: { id: string }, patch: Record<string, unknown>) => {
+      applyListingPatch(ref.id, patch);
+      return fakeTx;
+    },
+    set: (ref: { id: string }, patch: Record<string, unknown>) => {
+      applyListingPatch(ref.id, patch);
+      return fakeTx;
+    },
+  };
   const fakeDb = {
+    runTransaction: <T>(fn: (tx: typeof fakeTx) => Promise<T>): Promise<T> => {
+      const run = txChain.then(() => fn(fakeTx));
+      txChain = run.then(
+        () => undefined,
+        () => undefined,
+      );
+      return run;
+    },
     collection: (name: string) => {
       if (name === "blocklist") {
         return orderLimitGet(
@@ -110,41 +188,16 @@ vi.mock("@/lib/firebase-admin", () => {
             })),
             (d) => (d.data() as { created_at: string }).created_at,
           ),
-          // Doc-level access for the approve/reject/caption/retry endpoints.
-          doc: (id: string) => ({
+          // Queue endpoint: where("status", "in", [...]).get() over listingById.
+          where: (_field: string, _op: string, statuses: string[]) => ({
             get: async () => ({
-              exists: mocks.listingById.has(id),
-              data: () => mocks.listingById.get(id),
+              docs: [...mocks.listingById.entries()]
+                .filter(([, d]) => statuses.includes(d.status as string))
+                .map(([id, d]) => ({ id, data: () => d, ref: makeListingRef(id) })),
             }),
-            update: async (patch: Record<string, unknown>) => {
-              const cur = mocks.listingById.get(id);
-              if (!cur) throw new Error(`fakeDb listings doc(${id}) missing`);
-              // Firestore update() applies dotted keys ("publish.last_error")
-              // as nested sets — the fake must too, or a test asserting on
-              // the nested field would pass while prod loses the value.
-              const next: Record<string, unknown> = { ...cur };
-              for (const [key, value] of Object.entries(patch)) {
-                const parts = key.split(".");
-                if (parts.length === 1) {
-                  next[key] = value;
-                  continue;
-                }
-                let target = next;
-                for (let i = 0; i < parts.length - 1; i++) {
-                  const p = parts[i]!;
-                  const existing = target[p];
-                  const obj =
-                    existing && typeof existing === "object" && !Array.isArray(existing)
-                      ? { ...(existing as Record<string, unknown>) }
-                      : {};
-                  target[p] = obj;
-                  target = obj;
-                }
-                target[parts[parts.length - 1]!] = value;
-              }
-              mocks.listingById.set(id, next);
-            },
           }),
+          // Doc-level access for the approve/reject/caption/retry endpoints.
+          doc: (id: string) => makeListingRef(id),
         };
       }
       throw new Error(`fakeDb.collection(${name}) not stubbed`);
@@ -567,6 +620,163 @@ describe("POST /api/admin/listings/:id/reject", () => {
       ctx(["listings", "nope", "reject"]),
     );
     expect(res.status).toBe(404);
+  });
+});
+
+describe("admin transitions are atomic + live-media guarded (audit HIGH #1/#2)", () => {
+  const emptyReview = { note: null, decided_by: null, decided_at: null };
+  const livePublish = {
+    slot_at: null,
+    permalink: "https://www.instagram.com/p/live/",
+    media_id: "media_live",
+    attempts: 2,
+    last_error: "permalink fetch failed",
+  };
+
+  it("stale approve cannot overwrite a concurrent reject (TOCTOU)", async () => {
+    mocks.listingById.set("lst1", { status: "NEEDS_REVIEW", review: emptyReview });
+    // The kill-switch read happens after approve's first read: flip the
+    // listing to REJECTED there, modelling a second admin winning the race.
+    mocks.getAdminSettings.mockImplementationOnce(async () => {
+      mocks.listingById.set("lst1", {
+        status: "REJECTED",
+        review: { note: "no", decided_by: "other@test", decided_at: "2026-11-25T00:00:00.000Z" },
+      });
+      return mocks.settings;
+    });
+    const res = await POST(postReq("listings/lst1/approve", {}), ctx(["listings", "lst1", "approve"]));
+    expect(res.status).toBe(409);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "REJECTED" });
+    expect(enqueuePublishWorker).not.toHaveBeenCalled();
+  });
+
+  it("approve rollback does not overwrite a concurrent reject", async () => {
+    mocks.listingById.set("lst1", { status: "NEEDS_REVIEW", review: emptyReview });
+    vi.mocked(enqueuePublishWorker).mockImplementationOnce(async () => {
+      mocks.listingById.set("lst1", {
+        status: "REJECTED",
+        review: { note: "no", decided_by: "other@test", decided_at: "2026-11-25T00:00:00.000Z" },
+      });
+      return false;
+    });
+    const res = await POST(postReq("listings/lst1/approve", {}), ctx(["listings", "lst1", "approve"]));
+    expect(res.status).toBe(502);
+    expect(mocks.listingById.get("lst1")).toMatchObject({
+      status: "REJECTED",
+      review: { decided_by: "other@test" },
+    });
+  });
+
+  it("stale retry cannot overwrite a concurrent reject (TOCTOU)", async () => {
+    mocks.listingById.set("lst1", { status: "FAILED", publish: { last_error: "boom" } });
+    mocks.getAdminSettings.mockImplementationOnce(async () => {
+      mocks.listingById.set("lst1", { status: "REJECTED", publish: { last_error: "boom" } });
+      return mocks.settings;
+    });
+    const res = await POST(postReq("listings/lst1/retry", {}), ctx(["listings", "lst1", "retry"]));
+    expect(res.status).toBe(409);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "REJECTED" });
+    expect(enqueuePublishWorker).not.toHaveBeenCalled();
+  });
+
+  it("retry rollback does not overwrite a concurrent reject", async () => {
+    mocks.listingById.set("lst1", { status: "FAILED", publish: { last_error: "boom" } });
+    vi.mocked(enqueuePublishWorker).mockImplementationOnce(async () => {
+      mocks.listingById.set("lst1", { status: "REJECTED", publish: { last_error: null } });
+      return false;
+    });
+    const res = await POST(postReq("listings/lst1/retry", {}), ctx(["listings", "lst1", "retry"]));
+    expect(res.status).toBe(502);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "REJECTED" });
+  });
+
+  it("approve returns 409 for a FAILED listing with media_id (post already live)", async () => {
+    mocks.listingById.set("lst1", { status: "FAILED", review: emptyReview, publish: livePublish });
+    const res = await POST(postReq("listings/lst1/approve", {}), ctx(["listings", "lst1", "approve"]));
+    expect(res.status).toBe(409);
+    const data = (await res.json()) as { error: string };
+    expect(data.error).toMatch(/already live on Instagram/);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "FAILED" });
+    expect(enqueuePublishWorker).not.toHaveBeenCalled();
+  });
+
+  it("retry returns 409 for a FAILED listing with media_id (post already live)", async () => {
+    mocks.listingById.set("lst1", { status: "FAILED", publish: livePublish });
+    const res = await POST(postReq("listings/lst1/retry", {}), ctx(["listings", "lst1", "retry"]));
+    expect(res.status).toBe(409);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "FAILED" });
+    expect(enqueuePublishWorker).not.toHaveBeenCalled();
+  });
+
+  it("reject returns 409 for a FAILED listing with media_id (live post must not be rejected)", async () => {
+    mocks.listingById.set("lst1", { status: "FAILED", seller_igsid: "111", publish: livePublish });
+    const res = await POST(
+      postReq("listings/lst1/reject", { reason: "too late" }),
+      ctx(["listings", "lst1", "reject"]),
+    );
+    expect(res.status).toBe(409);
+    const data = (await res.json()) as { error: string };
+    expect(data.error).toMatch(/already live on Instagram/);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ status: "FAILED" });
+    expect(mocks.appendListingEvent).not.toHaveBeenCalledWith("lst1", "rejected", expect.anything());
+  });
+
+  it("caption edit returns 409 for a listing with media_id (caption lives on IG)", async () => {
+    mocks.listingById.set("lst1", { status: "FAILED", caption: "old", publish: livePublish });
+    const res = await POST(
+      postReq("listings/lst1/caption", { caption: "new" }),
+      ctx(["listings", "lst1", "caption"]),
+    );
+    expect(res.status).toBe(409);
+    expect(mocks.listingById.get("lst1")).toMatchObject({ caption: "old" });
+  });
+
+  it("queue surfaces media_id + published_terminal for a live-but-FAILED listing", async () => {
+    mocks.listingById.set("lst_live", {
+      status: "FAILED",
+      seller_igsid: "111222333444",
+      created_at: "2026-11-25T00:00:00.000Z",
+      caption: "cap",
+      extracted: null,
+      moderation: null,
+      missing: [],
+      photos: [],
+      publish: livePublish,
+      review: emptyReview,
+      consent: null,
+    });
+    const res = await GET(getReq("queue"), ctx(["queue"]));
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as {
+      items: Array<{ id: string; publish: { media_id: string | null; published_terminal: boolean } }>;
+    };
+    expect(data.items).toHaveLength(1);
+    expect(data.items[0]?.publish.media_id).toBe("media_live");
+    expect(data.items[0]?.publish.published_terminal).toBe(true);
+  });
+
+  it("activity surfaces published_terminal media_id + listing status", async () => {
+    mocks.listings.push({ id: "lst_live", created_at: "2026-11-25T00:00:00.000Z" });
+    mocks.events.push({
+      id: "e_live",
+      listingId: "lst_live",
+      data: {
+        type: "published_terminal",
+        at: "2026-11-25T01:00:00.000Z",
+        by: null,
+        detail: null,
+        media_id: "media_live",
+        status: "FAILED",
+      },
+    });
+    const res = await GET(getReq("activity"), ctx(["activity"]));
+    expect(res.status).toBe(200);
+    const data = (await res.json()) as {
+      items: Array<{ type: string; media_id: string | null; listing_status: string | null }>;
+    };
+    expect(data.items[0]?.type).toBe("published_terminal");
+    expect(data.items[0]?.media_id).toBe("media_live");
+    expect(data.items[0]?.listing_status).toBe("FAILED");
   });
 });
 
