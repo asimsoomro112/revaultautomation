@@ -309,6 +309,13 @@ export function makeFakeDeps(overrides: Partial<FakeDb> = {}): FakeDeps {
             if (existing && (existing.status === "DRAFT" || existing.status === "NEEDS_INFO")) {
               return { listing: existing, isNew: false };
             }
+            if (existing && existing.status === "CONFIRM") {
+              existing.status = "SUBMITTED";
+              fdb.events.push({
+                listingId: existing.id,
+                event: { type: "submitted", at: nowIso, note: "auto-submitted to admin review when the seller sent a new item" },
+              });
+            }
           }
           // Mirror prod (lib/db.ts): the daily limit is enforced here, in
           // the same transaction as the create — a reuse above never

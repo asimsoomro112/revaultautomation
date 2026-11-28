@@ -171,7 +171,7 @@ describe("handleFinalizePhotos: burst-combine — activity during extraction", (
     expect(res).toEqual({ ok: true });
     const listing = deps.fdb.listings.get("lst_1")!;
     expect(listing.extracted).not.toBeNull();
-    expect(listing.status).toBe("CONFIRM"); // makeVisionResult is a complete extraction
+    expect(listing.status).toBe("SUBMITTED"); // makeVisionResult is a complete extraction
     expect(deps.enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(0);
   });
 
@@ -237,7 +237,7 @@ describe("handleFinalizePhotos: burst fix — in-flight downloads (2026-11-24)",
     );
     expect(res).toEqual({ ok: true });
     expect(listing.extracted).not.toBeNull();
-    expect(listing.status).toBe("CONFIRM"); // makeVisionResult is a complete extraction
+    expect(listing.status).toBe("SUBMITTED"); // makeVisionResult is a complete extraction
     expect(deps.enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(0);
   });
 
@@ -435,23 +435,25 @@ describe("handleFinalizePhotos: stale-run hardening", () => {
 });
 
 describe("handleFinalizePhotos: PASS branch", () => {
-  it("complete extraction → CONFIRM + preview + consent buttons", async () => {
+  it("complete extraction → SUBMITTED to admin queue + submitted DM (no consent buttons)", async () => {
     await seedListing();
     const res = await handleFinalizePhotos(payload("lst_1", NOW), fdeps);
     expect(res.ok).toBe(true);
 
     const listing = deps.fdb.listings.get("lst_1")!;
-    expect(listing.status).toBe("CONFIRM");
+    expect(listing.status).toBe("SUBMITTED");
     expect(listing.extracted!.category).toBe("blazer");
     expect(listing.moderation!.verdict).toBe("PASS");
-    expect(deps.fdb.convos.get(IGSID)!.state).toBe("CONFIRM");
+    expect(listing.caption).toBeTruthy();
+    expect(deps.fdb.convos.get(IGSID)!.state).toBe("IDLE");
+    expect(deps.fdb.convos.get(IGSID)!.active_listing_id).toBeNull();
     const sent = deps.meta.sent[deps.meta.sent.length - 1]!;
-    expect(sent.opts.text).toMatch(/public/i);
-    expect(sent.opts.quickReplies!.map((q) => q.payload)).toContain("consent:post");
+    expect(sent.opts.text).toMatch(/submit|review/i);
+    expect(sent.opts.quickReplies).toBeUndefined();
     expect(deps.fdb.events.some((e) => e.event.type === "finalized")).toBe(true);
   });
 
-  it("incomplete extraction → NEEDS_INFO + one consolidated question", async () => {
+  it("incomplete extraction → NEEDS_REVIEW for the admin, no question to the customer", async () => {
     await seedListing();
     const vision = makeVisionResult({
       extracted: { ...fullTestExtracted(), price_pkr: null },
@@ -461,14 +463,17 @@ describe("handleFinalizePhotos: PASS branch", () => {
 
     await handleFinalizePhotos(payload("lst_1", NOW), fdeps);
     const listing = deps.fdb.listings.get("lst_1")!;
-    expect(listing.status).toBe("NEEDS_INFO");
+    expect(listing.status).toBe("NEEDS_REVIEW");
     expect(listing.missing).toEqual(["price_pkr"]);
-    expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
+    expect(listing.caption).toBeTruthy();
+    expect(deps.fdb.convos.get(IGSID)!.state).toBe("IDLE");
+    expect(deps.fdb.convos.get(IGSID)!.active_listing_id).toBeNull();
     const sent = deps.meta.sent[deps.meta.sent.length - 1]!;
-    expect(sent.opts.text).toMatch(/price|kimat|2500/i);
+    expect(sent.opts.text).toMatch(/team|review|check/i);
+    expect(sent.opts.quickReplies).toBeUndefined();
   });
 
-  it("<2 photos → NEEDS_INFO asking for photos first", async () => {
+  it("<2 photos → NEEDS_REVIEW with photos missing, no photo ask", async () => {
     await seedListing();
     const listing = deps.fdb.listings.get("lst_1")!;
     listing.photos = listing.photos.slice(0, 1);
@@ -476,9 +481,10 @@ describe("handleFinalizePhotos: PASS branch", () => {
     deps.gemini.extractListingImpl = async () => makeVisionResult({ missing: [] });
 
     await handleFinalizePhotos(payload("lst_1", NOW), fdeps);
-    expect(deps.fdb.listings.get("lst_1")!.status).toBe("NEEDS_INFO");
+    expect(listing.status).toBe("NEEDS_REVIEW");
+    expect(listing.missing).toContain("photos");
     const sent = deps.meta.sent[deps.meta.sent.length - 1]!;
-    expect(sent.opts.text).toMatch(/photo|tasveer|2/i);
+    expect(sent.opts.text).toMatch(/team|review|check/i);
   });
 });
 
@@ -529,7 +535,7 @@ describe("handleFinalizePhotos: error paths (retry, then fail closed)", () => {
     expect(retry!.opts?.delaySec).toBe(60);
   });
 
-  it("retry succeeds on the second attempt → CONFIRM", async () => {
+  it("retry succeeds on the second attempt → SUBMITTED", async () => {
     await seedListing();
     let calls = 0;
     deps.gemini.extractListingImpl = async () => {
@@ -541,7 +547,7 @@ describe("handleFinalizePhotos: error paths (retry, then fail closed)", () => {
     await handleFinalizePhotos(payload("lst_1", NOW), fdeps);
     expect(deps.fdb.listings.get("lst_1")!.status).toBe("DRAFT");
     await handleFinalizePhotos(payload("lst_1", NOW, 1), fdeps);
-    expect(deps.fdb.listings.get("lst_1")!.status).toBe("CONFIRM");
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("SUBMITTED");
     expect(calls).toBe(2);
   });
 
@@ -586,7 +592,7 @@ describe("handleFinalizePhotos: error paths (retry, then fail closed)", () => {
       makeVisionResult({ extracted: blankTestExtracted(), missing: ["category", "size", "condition", "price_pkr", "city"] });
 
     await handleFinalizePhotos(payload("lst_1", NOW), fdeps);
-    expect(deps.fdb.listings.get("lst_1")!.status).toBe("NEEDS_INFO");
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("NEEDS_REVIEW");
     expect(deps.fdb.events.some((e) => e.event.type === "finalized")).toBe(true);
   });
 });
@@ -636,7 +642,7 @@ describe("handleFinalizePhotos: perceptual hashing (duplicate index)", () => {
     await seedListing(); // downloads are garbage buffers ("img0"/"img1")
     const res = await handleFinalizePhotos(payload("lst_1", NOW), fdeps);
     expect(res.ok).toBe(true);
-    // dhash failed → seed placeholder kept; finalize still reached CONFIRM.
-    expect(deps.fdb.listings.get("lst_1")!.status).toBe("CONFIRM");
+    // dhash failed → seed placeholder kept; finalize still submitted.
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("SUBMITTED");
   });
 });

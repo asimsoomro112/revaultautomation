@@ -279,6 +279,17 @@ export async function getOrCreateActiveListing(
       if (existing && (existing.status === "DRAFT" || existing.status === "NEEDS_INFO")) {
         return { listing: existing, isNew: false };
       }
+      if (existing && existing.status === "CONFIRM") {
+        // Legacy confirm-pending listing: the seller moved on to a new
+        // item, so hand the finished listing to the admin queue instead
+        // of stranding it outside every queue view.
+        tx.update(col("listings").doc(existing.id), { status: "SUBMITTED" });
+        tx.set(col("listings").doc(existing.id).collection("events").doc(), {
+          type: "submitted",
+          at: nowIso,
+          note: "auto-submitted to admin review when the seller sent a new item",
+        });
+      }
     }
     // No reusable listing: a new one would be created — enforce the daily
     // limit first (a reuse above never consumes a slot).

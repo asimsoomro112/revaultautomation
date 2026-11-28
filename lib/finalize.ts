@@ -6,8 +6,11 @@
  * moderation pipeline, and branches:
  *   FAIL   → listing REJECTED + polite rejection DM
  *   REVIEW → listing NEEDS_REVIEW + Telegram admin alert (+ holding DM)
- *   PASS   → missing fields → NEEDS_INFO + one consolidated question
- *          → complete      → CONFIRM + preview + consent quick replies
+ *   PASS   → complete      → SUBMITTED (admin queue) + submitted DM
+ *          → missing fields → NEEDS_REVIEW (admin decides) + holding DM
+ *
+ * The customer is never interrogated for missing fields (Asim, 2026-11-28):
+ * pictures + details in, admin approves or rejects from /admin.
  *
  * Fail closed: ANY error (Gemini, download, schema) → NEEDS_REVIEW + alert,
  * never auto-pass. Pure apart from injected deps — unit-testable with fakes;
@@ -19,11 +22,10 @@ import { GeminiError } from "./gemini";
 import { applyModeration } from "./moderation";
 import { dhash } from "./dhash";
 import {
-  moveToConfirm,
-  nextQuestion,
   readyForConfirm,
   sendSafe,
   setConversationState,
+  submitToAdminReview,
   type Deps,
 } from "./conversation";
 import { politeReject, reviewHoldReply } from "./prompts";
@@ -83,6 +85,26 @@ async function markNeedsReview(
     igsid: listing.seller_igsid,
   });
   await sendSafe(deps, convo, { text: reviewHoldReply(convo.lang) });
+}
+
+/**
+ * Best-effort caption draft for listings routed to NEEDS_REVIEW after
+ * extraction, so an admin approve can publish without first saving a
+ * caption by hand (the publish worker refuses a caption-less listing).
+ * A caption failure never blocks the review routing itself.
+ */
+async function ensureCaptionDraft(deps: FinalizeDeps, listing: ListingDoc, convo: ConversationDoc): Promise<void> {
+  if (listing.caption || !listing.extracted) return;
+  try {
+    const caption = await deps.buildCaption(listing.extracted, convo.lang);
+    await deps.db.saveListing(listing.id, { caption });
+    listing.caption = caption;
+  } catch (err) {
+    log.warn("finalize.caption_draft_failed", {
+      listing_id: listing.id,
+      error: err instanceof Error ? err.message.slice(0, 160) : String(err),
+    });
+  }
 }
 
 export async function handleFinalizePhotos(
@@ -320,6 +342,7 @@ export async function handleFinalizePhotos(
     // review instead. (A FAIL above still wins: the examined photos are
     // already bad, so the listing is rejected outright.)
     if (listing.photos.length > buffers.length) {
+      await ensureCaptionDraft(deps, listing, convo);
       await markNeedsReview(
         deps,
         listing,
@@ -330,26 +353,28 @@ export async function handleFinalizePhotos(
     }
 
     if (mod.verdict === "REVIEW") {
+      await ensureCaptionDraft(deps, listing, convo);
       await markNeedsReview(deps, listing, convo, `moderation REVIEW: ${mod.reasons.join("; ") || "no reason"}`);
       return { ok: true };
     }
 
-    // PASS — check completeness.
+    // PASS — hand it to the admin either way. Complete listings land in
+    // the queue as SUBMITTED; incomplete ones as NEEDS_REVIEW with the
+    // missing fields recorded. No follow-up questions to the customer and
+    // no seller confirm tap (Asim, 2026-11-28) — approve/reject is the
+    // admin's call, and releasing the conversation lets the customer's
+    // next post start a fresh listing.
     const check = readyForConfirm(listing);
     if (!check.ok) {
-      listing.status = "NEEDS_INFO";
-      listing.missing = check.missing;
-      // Narrow patch, not a full-doc save (see markNeedsReview).
-      await deps.db.saveListing(listing.id, { status: "NEEDS_INFO", missing: check.missing });
-      setConversationState(convo, "NEEDS_INFO");
-      // Narrow patch of only the field finalize owns (see markNeedsReview).
-      await deps.db.saveConversation(convo.igsid, { state: convo.state });
-      const q = nextQuestion(check.missing, convo.lang, listing.photos.length);
-      await sendSafe(deps, convo, q.quickReplies ? { text: q.question, quickReplies: q.quickReplies } : { text: q.question });
+      await submitToAdminReview(deps, convo, listing, {
+        status: "NEEDS_REVIEW",
+        missing: check.missing,
+        note: `incomplete listing sent to admin review — missing: ${check.missing.join(", ")}`,
+      });
       return { ok: true };
     }
 
-    await moveToConfirm(deps, convo, listing);
+    await submitToAdminReview(deps, convo, listing, { status: "SUBMITTED", missing: [] });
     return { ok: true };
   } catch (err) {
     // A transient failure (Gemini 503/429 spike, network blip, storage

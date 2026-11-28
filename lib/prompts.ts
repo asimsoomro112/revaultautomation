@@ -261,16 +261,16 @@ export function reviewHoldReply(lang: Lang): string {
   }
 }
 
-/** Holding reply while a late photo is being checked before the preview. */
+/** Holding reply while a late photo is being checked before submission. */
 export function photoCheckHoldReply(lang: Lang): string {
   switch (lang) {
     case "ur":
-      return "آپ کی نئی تصویر چیک ہو رہی ہے 👀 تھوڑا انتظار کریں — پریویو جلد بھیجتا ہوں!";
+      return "آپ کی نئی تصویر چیک ہو رہی ہے 👀 تھوڑا انتظار کریں — جلد اپڈیٹ ملے گی!";
     case "en":
-      return "Your new photo is being checked 👀 Please wait a moment — I'll send the preview soon!";
+      return "Your new photo is being checked 👀 Please wait a moment — you'll get an update soon!";
     case "roman":
     default:
-      return "Aapki nayi photo check ho rahi hai 👀 Thora wait karein — preview jald bhejta hoon!";
+      return "Aapki nayi photo check ho rahi hai 👀 Thora wait karein — update jald milegi!";
   }
 }
 
@@ -301,16 +301,17 @@ export function humanHandoffReply(lang: Lang): string {
   }
 }
 
-/** Brief ack while still collecting (photos/details trickling in). */
+/** Brief ack while still collecting (photos/details trickling in). Neutral
+ * on purpose: the bot does not ask follow-up questions (Asim, 2026-11-28). */
 export function collectingAck(lang: Lang): string {
   switch (lang) {
     case "ur":
-      return "نوٹ کر لیا 👍 بس 2 یا زیادہ صاف تصاویر بھیج دیں!";
+      return "نوٹ کر لیا 👍";
     case "en":
-      return "Noted 👍 Just send 2+ clear photos when ready!";
+      return "Noted 👍";
     case "roman":
     default:
-      return "Note kar liya 👍 Bas 2+ clear photos bhej dein!";
+      return "Note kar liya 👍";
   }
 }
 

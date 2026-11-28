@@ -90,6 +90,9 @@ function makeDeps(opts: { maxPerDay?: number } = {}): {
           if (existing && (existing.status === "DRAFT" || existing.status === "NEEDS_INFO")) {
             return { listing: existing, isNew: false };
           }
+          if (existing && existing.status === "CONFIRM") {
+            existing.status = "SUBMITTED";
+          }
         }
         // Mirror prod (lib/db.ts): daily limit enforced in the create
         // transaction; a reuse above never consumes a slot.

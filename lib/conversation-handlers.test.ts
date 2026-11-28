@@ -229,27 +229,28 @@ describe("handleMessage: NEEDS_INFO typed answers", () => {
     return { convo, listing };
   }
 
-  it("typed price answer → CONFIRM + preview + consent quick replies", async () => {
+  it("typed text joins chat_text for extraction — no question, no consent buttons", async () => {
     await seedNeedsInfo();
     await handleMessage(payload("mid_5"), makeInbound("text", "mid_5", { text: "2500" }), deps);
 
     const listing = deps.fdb.listings.get("lst_1")!;
-    expect(listing.extracted!.price_pkr).toBe(2500);
-    expect(listing.status).toBe("CONFIRM");
-    expect(deps.fdb.convos.get(IGSID)!.state).toBe("CONFIRM");
+    expect(listing.chat_text).toMatch(/2500/); // extraction will read it on the re-armed finalize
+    expect(listing.status).toBe("NEEDS_INFO");
+    expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
+    expect(deps.enqueued.filter((e) => e.route === "finalize-photos").length).toBeGreaterThan(0);
     const sent = deps.meta.sent[deps.meta.sent.length - 1]!;
-    expect(sent.opts.text).toMatch(/public/i); // consent warning included
-    expect(sent.opts.quickReplies!.map((q) => q.payload)).toEqual(
-      expect.arrayContaining(["consent:post", "consent:cancel"]),
-    );
+    expect(sent.opts.text).toMatch(/Noted|Note kar liya/);
+    expect(sent.opts.quickReplies).toBeUndefined();
   });
 
-  it("unparseable answer → clarify retry, stays in NEEDS_INFO", async () => {
+  it("unparseable text → kept as details, no clarify question", async () => {
     await seedNeedsInfo();
     await handleMessage(payload("mid_5"), makeInbound("text", "mid_5", { text: "pata nahi" }), deps);
-    expect(deps.fdb.listings.get("lst_1")!.status).toBe("NEEDS_INFO");
+    const listing = deps.fdb.listings.get("lst_1")!;
+    expect(listing.status).toBe("NEEDS_INFO");
+    expect(listing.chat_text).toMatch(/pata nahi/);
     expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
-    expect(deps.meta.sent[deps.meta.sent.length - 1]!.opts.text).toMatch(/2500|price|kimat/i);
+    expect(deps.meta.sent[deps.meta.sent.length - 1]!.opts.text).toMatch(/Noted|Note kar liya/);
   });
 
   it("quick_reply info tap → applies value", async () => {
@@ -260,7 +261,9 @@ describe("handleMessage: NEEDS_INFO typed answers", () => {
       deps,
     );
     expect(deps.fdb.listings.get("lst_1")!.extracted!.price_pkr).toBe(3000);
-    expect(deps.fdb.convos.get(IGSID)!.state).toBe("CONFIRM");
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("SUBMITTED");
+    expect(deps.fdb.convos.get(IGSID)!.state).toBe("IDLE");
+    expect(deps.fdb.convos.get(IGSID)!.active_listing_id).toBeNull();
   });
 
   it("late unprocessed photo + answer → stays NEEDS_INFO, finalize re-armed, no confirm", async () => {
@@ -275,13 +278,13 @@ describe("handleMessage: NEEDS_INFO typed answers", () => {
     await handleMessage(payload("mid_5"), makeInbound("text", "mid_5", { text: "2500" }), deps);
 
     const updated = deps.fdb.listings.get("lst_1")!;
-    expect(updated.extracted!.price_pkr).toBe(2500); // the answer WAS saved
+    expect(updated.chat_text).toMatch(/2500/); // the text WAS saved for extraction
     expect(updated.status).toBe("NEEDS_INFO");
     expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
     expect(deps.enqueued.filter((e) => e.route === "finalize-photos").length).toBeGreaterThan(0);
     expect(deps.fdb.events.some((e) => e.event.type === "confirm")).toBe(false);
     const sent = deps.meta.sent[deps.meta.sent.length - 1]!;
-    expect(sent.opts.quickReplies).toBeUndefined(); // holding reply, no consent buttons
+    expect(sent.opts.quickReplies).toBeUndefined(); // plain ack, no consent buttons
   });
 
   it("late unprocessed photo + details dump → stays NEEDS_INFO, finalize re-armed", async () => {
@@ -293,7 +296,7 @@ describe("handleMessage: NEEDS_INFO typed answers", () => {
     await handleMessage(payload("mid_5"), makeInbound("text", "mid_5", { text: "Price: 2500" }), deps);
 
     const updated = deps.fdb.listings.get("lst_1")!;
-    expect(updated.extracted!.price_pkr).toBe(2500);
+    expect(updated.chat_text).toMatch(/Price: 2500/);
     expect(updated.status).toBe("NEEDS_INFO");
     expect(deps.enqueued.filter((e) => e.route === "finalize-photos").length).toBeGreaterThan(0);
     expect(deps.fdb.events.some((e) => e.event.type === "confirm")).toBe(false);
@@ -318,11 +321,11 @@ describe("handleMessage: NEEDS_INFO typed answers", () => {
     expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
     expect(updated.chat_text).toMatch(/ok/);
     const sent = deps.meta.sent[deps.meta.sent.length - 1]!;
-    expect(sent.opts.text).toMatch(/wait karein|wait a moment|انتظار/);
-    expect(sent.opts.quickReplies).toBeUndefined(); // holding reply, no consent buttons
+    expect(sent.opts.text).toMatch(/Noted|Note kar liya/);
+    expect(sent.opts.quickReplies).toBeUndefined(); // plain ack, no consent buttons
   });
 
-  it("multi-line details dump applies every field → CONFIRM (Nina, 2026-11-23)", async () => {
+  it("multi-line details dump joins chat_text for extraction (Nina, 2026-11-23)", async () => {
     const convo = await deps.db.getOrCreateConversation(IGSID);
     const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
     listing.status = "NEEDS_INFO";
@@ -347,14 +350,13 @@ describe("handleMessage: NEEDS_INFO typed answers", () => {
     await handleMessage(payload("mid_7"), makeInbound("text", "mid_7", { text: dump }), deps);
 
     const updated = deps.fdb.listings.get("lst_1")!;
-    expect(updated.extracted!.brand).toBe("Tinnie Tots");
-    expect(updated.extracted!.size).toBe("5-6 YEARS");
-    expect(updated.extracted!.condition).toBe("like_new");
-    expect(updated.extracted!.price_pkr).toBe(2000);
-    expect(updated.extracted!.city).toBe("Lahore");
-    expect(updated.extracted!.measurements).toBe('25.5"');
-    expect(updated.status).toBe("CONFIRM");
-    expect(deps.fdb.convos.get(IGSID)!.state).toBe("CONFIRM");
+    // The dump is stored verbatim for the re-armed finalize extraction —
+    // the bot no longer parses answers or asks follow-up questions.
+    expect(updated.chat_text).toMatch(/Brand: Tinnie Tots/);
+    expect(updated.chat_text).toMatch(/Discounted price: 2k/);
+    expect(updated.status).toBe("NEEDS_INFO");
+    expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
+    expect(deps.enqueued.filter((e) => e.route === "finalize-photos").length).toBeGreaterThan(0);
   });
 });
 
@@ -517,7 +519,7 @@ describe("handleMessage: consent", () => {
     expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
   });
 
-  it("consent:edit → typed caption is kept (not regenerated) + preview shows it", async () => {
+  it("consent:edit → typed caption is kept (not regenerated) + submitted to admin", async () => {
     await seedConfirm();
     await handleMessage(
       payload("mid_9"),
@@ -531,13 +533,10 @@ describe("handleMessage: consent", () => {
     );
     const listing = deps.fdb.listings.get("lst_1")!;
     expect(listing.caption).toBe("My preloved Zara dress, barely worn!");
-    expect(listing.status).toBe("CONFIRM");
-    expect(deps.fdb.convos.get(IGSID)!.state).toBe("CONFIRM");
+    expect(listing.status).toBe("SUBMITTED");
+    expect(deps.fdb.convos.get(IGSID)!.state).toBe("IDLE");
     const sent = deps.meta.sent[deps.meta.sent.length - 1]!;
-    expect(sent.opts.text).toContain("My preloved Zara dress, barely worn!");
-    expect(sent.opts.quickReplies!.map((q) => q.payload)).toEqual(
-      expect.arrayContaining(["consent:post", "consent:cancel"]),
-    );
+    expect(sent.opts.quickReplies).toBeUndefined();
   });
 
   it("caption containing a 'Key: value' line is kept verbatim (not parsed as a field dump)", async () => {
@@ -555,7 +554,7 @@ describe("handleMessage: consent", () => {
     const listing = deps.fdb.listings.get("lst_1")!;
     expect(listing.caption).toBe("My Zara dress, barely worn!\nPrice: 1500 is a steal");
     expect(listing.extracted!.price_pkr).toBe(2500); // not overwritten by the "Price:" line
-    expect(listing.status).toBe("CONFIRM");
+    expect(listing.status).toBe("SUBMITTED");
   });
 
   it("late consent:cancel after Post → no cancel reply, listing stays SUBMITTED", async () => {
@@ -608,12 +607,22 @@ describe("handleMessage: consent", () => {
     expect(deps.meta.sent.length).toBe(sentBefore);
   });
 
-  it("CONFIRM + stray text → nudge with consent buttons (no state change)", async () => {
+  it("CONFIRM + stray text → listing handed to admin, no consent nudge", async () => {
     await seedConfirm();
     await handleMessage(payload("mid_9"), makeInbound("text", "mid_9", { text: "hmm" }), deps);
-    expect(deps.fdb.convos.get(IGSID)!.state).toBe("CONFIRM");
-    const sent = deps.meta.sent[deps.meta.sent.length - 1]!;
-    expect(sent.opts.quickReplies!.map((q) => q.payload)).toContain("consent:post");
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("SUBMITTED");
+    expect(deps.fdb.convos.get(IGSID)!.state).not.toBe("CONFIRM");
+    expect(
+      deps.meta.sent.some((s) => s.opts.quickReplies?.some((q) => q.payload === "consent:post")),
+    ).toBe(false);
+  });
+
+  it("a new item's photo auto-submits a legacy CONFIRM listing and starts fresh", async () => {
+    await seedConfirm();
+    const res = await deps.db.getOrCreateActiveListing(IGSID, NOW, 10);
+    expect(res.isNew).toBe(true);
+    expect(res.listing!.id).not.toBe("lst_1");
+    expect(deps.fdb.listings.get("lst_1")!.status).toBe("SUBMITTED");
   });
 });
 
@@ -655,7 +664,7 @@ describe("handleMessage: stale quick reply on CONFIRM with an unprocessed photo"
 });
 
 describe("scripted multi-turn flow", () => {
-  it("IDLE→COLLECTING→NEEDS_INFO→CONFIRM→SUBMITTED", async () => {
+  it("IDLE→COLLECTING→NEEDS_INFO→SUBMITTED (admin decides)", async () => {
     deps.gemini.classifyIntentImpl = async () => ({ intent: "SELLER_SUBMIT", confidence: 0.9, lang: "roman" });
 
     // 1. Seller opens with text.
@@ -679,21 +688,21 @@ describe("scripted multi-turn flow", () => {
     listing.missing = ["price_pkr"];
     convo.state = "NEEDS_INFO";
 
-    // 4. Seller answers the price question.
+    // 4. Seller sends the price as plain text — stored for extraction,
+    // finalize re-armed, no question and no consent step.
     await handleMessage(payload("mid_3"), makeInbound("text", "mid_3", { text: "Rs 2,500" }), deps);
     convo = deps.fdb.convos.get(IGSID)!;
-    expect(convo.state).toBe("CONFIRM");
+    expect(convo.state).toBe("NEEDS_INFO");
+    expect(deps.fdb.listings.get(listingId)!.chat_text).toMatch(/Rs 2,500/);
+    expect(deps.enqueued.filter((e) => e.route === "finalize-photos").length).toBeGreaterThan(0);
 
-    // 5. Seller taps Post it.
-    await handleMessage(
-      payload("mid_4"),
-      makeInbound("quick_reply", "mid_4", { quick_reply_payload: "consent:post", text: "Post it" }),
-      deps,
-    );
-    convo = deps.fdb.convos.get(IGSID)!;
-    expect(convo.state).toBe("IDLE");
+    // 5. Finalize (elsewhere) submits the complete listing to the admin
+    // queue and releases the conversation.
+    const done = deps.fdb.listings.get(listingId)!;
+    done.status = "SUBMITTED";
+    convo.state = "IDLE";
+    convo.active_listing_id = null;
     expect(deps.fdb.listings.get(listingId)!.status).toBe("SUBMITTED");
-    expect(deps.enqueued[0]).toMatchObject({ route: "publish", payload: { kind: "publish", listing_id: listingId } });
 
     // 6. Vision sanity: the fake extraction path feeds the same shape.
     expect(makeVisionResult().extracted.price_pkr).toBe(2500);

@@ -29,7 +29,6 @@ import type { AlertOpts } from "./telegram";
 import {
   buyerFaqReply,
   cancelReply,
-  clarifyRetry,
   collectingAck,
   confirmNudge,
   confirmPreviewText,
@@ -41,6 +40,7 @@ import {
   photoCheckHoldReply,
   questionForField,
   type QuestionSpec,
+  reviewHoldReply,
   sellerGreeting,
   spamWarning,
   submittedReply,
@@ -532,34 +532,6 @@ export async function sendSafe(
   }
 }
 
-/**
- * Confirm with the seller's own caption (consent:edit flow). moveToConfirm
- * regenerates the caption from `extracted` via buildCaption — using it here
- * would discard the edit the seller just typed. The caption was already
- * saved by handleInfoAnswer's mutate; only the status transition + preview
- * remain. The preview shows the seller's caption, so they can re-edit if
- * it is not what they meant.
- */
-async function confirmWithSellerCaption(
-  deps: Deps,
-  convo: ConversationDoc,
-  listing: ListingDoc,
-): Promise<void> {
-  if (!listing.extracted) throw new Error("confirmWithSellerCaption: listing has no extracted data");
-  if (!listing.caption) throw new Error("confirmWithSellerCaption: listing has no caption");
-  // Narrow patch, not a full-doc save (see moveToConfirm).
-  await deps.db.saveListing(listing.id, { status: "CONFIRM" });
-  listing.status = "CONFIRM";
-  await deps.db.appendListingEvent(listing.id, { type: "confirm", caption_chars: listing.caption.length });
-  setConversationState(convo, "CONFIRM");
-  await persistConvo(deps, convo);
-  const preview = confirmPreviewText(listing.extracted, listing.caption, convo.lang);
-  await sendSafe(deps, convo, {
-    text: `${preview}\n\n${consentText(convo.lang)}`,
-    quickReplies: consentQuickReplies(),
-  });
-}
-
 /** Pending-question source: the stored missing list wins — readyForConfirm
  * never lists "caption" (it is generated, not extracted), so the edit
  * flow's ["caption"] would otherwise resolve to the "category" fallback
@@ -570,17 +542,17 @@ function pendingMissing(listing: ListingDoc): string[] {
 }
 
 /** True when the listing has a photo that never went through finalize
- * (ingest leaves phash:""; finalize fills it during extraction). Confirming
+ * (ingest leaves phash:""; finalize fills it during extraction). Submitting
  * such a listing would publish an unexamined photo. */
 function hasUnprocessedPhoto(listing: ListingDoc): boolean {
   return listing.photos.some((p) => !p.phash);
 }
 
-/** Defer CONFIRM until finalize has checked every photo: re-arm it with the
- * fresh activity (the answer's bump invalidated the photo's own armed
+/** Defer submission until finalize has checked every photo: re-arm it with
+ * the fresh activity (the answer's bump invalidated the photo's own armed
  * finalize), stay in NEEDS_INFO, and tell the seller to wait. The re-armed
- * finalize moves the listing to CONFIRM (or REVIEW) once checked — no
- * deadlock, since finalize's own moveToConfirm does not check phash.
+ * finalize submits the listing to admin review once checked — no deadlock,
+ * since finalize's own submission does not check phash.
  *
  * The LISTING status must move to NEEDS_INFO too, not just the convo: a
  * stale quick-reply tap can reach this defer while the listing is CONFIRM
@@ -627,6 +599,59 @@ export async function moveToConfirm(deps: Deps, convo: ConversationDoc, listing:
     text: `${preview}\n\n${consentText(convo.lang)}`,
     quickReplies: consentQuickReplies(),
   });
+}
+
+/**
+ * Hand the listing to the admin (Asim, 2026-11-28): once the customer has
+ * sent pictures + details, the rest is the admin's call — approve or
+ * reject in /admin. The bot does NOT interrogate the customer for missing
+ * fields and does NOT ask for a seller confirm tap: a complete listing
+ * lands in the queue as SUBMITTED, an incomplete one as NEEDS_REVIEW with
+ * its missing fields recorded for the admin. Either way the conversation
+ * is released (IDLE, no active listing) so the customer's next post starts
+ * a fresh listing instead of being folded into this one.
+ */
+export async function submitToAdminReview(
+  deps: Deps,
+  convo: ConversationDoc,
+  listing: ListingDoc,
+  opts: { status: "SUBMITTED" | "NEEDS_REVIEW"; missing: string[]; keepCaption?: boolean; note?: string },
+): Promise<void> {
+  const caption =
+    opts.keepCaption && listing.caption
+      ? listing.caption
+      : listing.extracted
+        ? await deps.buildCaption(listing.extracted, convo.lang)
+        : (listing.caption ?? "");
+  // Narrow patch, not a full-doc save: a concurrent photo/chat append must
+  // never be clobbered by this status transition.
+  await deps.db.saveListing(listing.id, { caption, status: opts.status, missing: opts.missing });
+  listing.caption = caption;
+  listing.status = opts.status;
+  listing.missing = opts.missing;
+  if (opts.status === "NEEDS_REVIEW") {
+    await deps.db.appendListingEvent(listing.id, {
+      type: "needs_review",
+      note: (opts.note ?? `incomplete listing sent to admin review — missing: ${opts.missing.join(", ") || "none"}`).slice(0, 300),
+    });
+  } else {
+    await deps.db.appendListingEvent(listing.id, { type: "submitted", caption_chars: caption.length });
+  }
+  setConversationState(convo, "IDLE");
+  convo.active_listing_id = null;
+  // Narrow patch of only the fields this transition owns (the finalize
+  // worker's convo snapshot predates the vision call — a full save would
+  // clobber a seller message that arrived during extraction).
+  await deps.db.saveConversation(convo.igsid, { state: convo.state, active_listing_id: null });
+  if (opts.status === "NEEDS_REVIEW") {
+    await deps.notifyAdmin(
+      `🔍 Review needed — listing ${listing.id} (seller ${listing.seller_igsid}): missing ${opts.missing.join(", ") || "none"}`,
+      { listingId: listing.id, igsid: listing.seller_igsid },
+    );
+    await sendSafe(deps, convo, { text: reviewHoldReply(convo.lang) });
+  } else {
+    await sendSafe(deps, convo, { text: submittedReply(convo.lang) });
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -910,43 +935,38 @@ async function handleText(deps: Deps, convo: ConversationDoc, text: string, nowI
         await persistConvo(deps, convo);
         break;
       }
-      // A multi-line details dump answers several fields at once — parse
-      // every recognizable field out of it before falling back to the
-      // single pending-question answer. NOT when the pending question is the
-      // caption edit: a caption containing a "Key: value" line must be kept
-      // verbatim, not parsed as field updates.
+      // No puchtash (Asim, 2026-11-28): a text here is more details for the
+      // pending extraction, never an answer to a bot question. Append it,
+      // re-arm finalize, and let extraction + admin review decide — missing
+      // fields go to /admin as NEEDS_REVIEW, not back to the customer as
+      // questions. The one exception is the legacy caption-edit flow
+      // (missing == ["caption"]), where the text IS the seller's caption.
       const missing = pendingMissing(listing);
-      if (missing.length === 0) {
-        // The listing is complete but still NEEDS_INFO (e.g. waiting on the
-        // photo-check defer): there is NO pending question, so routing this
-        // text as an answer would corrupt a field — nextQuestion([]) falls
-        // back to "category", and a plain "ok" / "theek hai" would become
-        // the category (2026-11-24 re-audit Lane C N-H2). Append the text
-        // to chat_text so extraction still sees it, re-arm finalize, and
-        // tell the seller to wait.
-        await deps.db.mutateListing(listing.id, (doc) => ({
-          patch: { chat_text: appendChat(doc.chat_text ?? "", text), last_activity_at: nowIso },
-          result: undefined,
-        }));
-        await rearmFinalizeForText(deps, listing, nowIso);
-        await persistConvo(deps, convo);
-        await sendSafe(deps, convo, { text: photoCheckHoldReply(convo.lang) });
+      if (missing.length === 1 && missing[0] === "caption") {
+        await handleInfoAnswer(deps, convo, listing, "caption", text);
         break;
       }
-      const pending = nextQuestion(missing, convo.lang, listing.photos.length);
-      if (pending.field !== "caption") {
-        const dump = parseDetailsDump(text);
-        if (dump.length > 0 && (await applyDetailsDump(deps, convo, listing, text, dump))) break;
-      }
-      // Typed answer to the pending question. Quick-reply taps arrive as
-      // quick_reply kind; typed text may match a numbered/word fallback.
-      const matched = pending.quickReplies ? matchTypedAnswer(text, pending.quickReplies) : null;
-      await handleInfoAnswer(deps, convo, listing, pending.field, matched ?? text);
+      await deps.db.mutateListing(listing.id, (doc) => ({
+        patch: { chat_text: appendChat(doc.chat_text ?? "", text), last_activity_at: nowIso },
+        result: undefined,
+      }));
+      await rearmFinalizeForText(deps, listing, nowIso);
+      await persistConvo(deps, convo);
+      await sendSafe(deps, convo, { text: collectingAck(convo.lang) });
       break;
     }
     case "CONFIRM": {
-      await persistConvo(deps, convo);
-      await sendSafe(deps, convo, { text: confirmNudge(convo.lang), quickReplies: consentQuickReplies() });
+      // Legacy state (finalize no longer creates it): the listing is
+      // complete, so hand it to the admin instead of nudging for a confirm
+      // tap, then treat this text as the start of whatever comes next.
+      const listing = await activeListing(deps, convo);
+      if (listing && listing.status === "CONFIRM") {
+        await submitToAdminReview(deps, convo, listing, { status: "SUBMITTED", missing: [], keepCaption: true });
+        await handleText(deps, convo, text, nowIso);
+      } else {
+        await persistConvo(deps, convo);
+        await sendSafe(deps, convo, { text: confirmNudge(convo.lang), quickReplies: consentQuickReplies() });
+      }
       break;
     }
   }
@@ -1060,17 +1080,26 @@ async function handleInfoAnswer(
   rawValue: string,
 ): Promise<void> {
   if (field === "photos") {
-    // Photos can't be answered by text — re-ask.
-    const q = nextQuestion(["photos"], convo.lang, listing.photos.length);
-    await persistConvo(deps, convo);
-    await sendSafe(deps, convo, { text: q.question });
+    // Photos can't be answered by text — and the bot no longer re-asks.
+    // The listing goes to the admin as-is; approve/reject is their call.
+    await submitToAdminReview(deps, convo, listing, {
+      status: "NEEDS_REVIEW",
+      missing: readyForConfirm(listing).missing,
+    });
     return;
   }
   const coerced = coerceFieldValue(field, rawValue);
   if (!coerced.ok) {
-    const q = nextQuestion(pendingMissing(listing), convo.lang, listing.photos.length);
+    // Unparseable as that field — keep it as details for extraction instead
+    // of interrogating the customer again.
+    const nowIso = deps.now();
+    await deps.db.mutateListing(listing.id, (doc) => ({
+      patch: { chat_text: appendChat(doc.chat_text ?? "", rawValue.trim()), last_activity_at: nowIso },
+      result: undefined,
+    }));
+    await rearmFinalizeForText(deps, listing, nowIso);
     await persistConvo(deps, convo);
-    await sendSafe(deps, convo, sendOpts(clarifyRetry(convo.lang, q.question), q.quickReplies));
+    await sendSafe(deps, convo, { text: collectingAck(convo.lang) });
     return;
   }
   // Apply to the FRESH doc inside the transaction: a concurrent photo ingest
@@ -1090,82 +1119,23 @@ async function handleInfoAnswer(
   const after = readyForConfirm(updated);
   if (after.ok) {
     // A photo that arrived after the last extraction has never been visioned
-    // or moderated — confirming now would publish it unexamined.
+    // or moderated — submitting now would publish it unexamined.
     if (hasUnprocessedPhoto(updated)) {
       await deferConfirmForPhotoCheck(deps, convo, updated, nowIso);
       return;
     }
-    // A caption edit must keep the seller's words: moveToConfirm would
-    // regenerate the caption from `extracted` and discard the edit.
-    if (field === "caption") {
-      await confirmWithSellerCaption(deps, convo, updated);
-    } else {
-      await moveToConfirm(deps, convo, updated);
-    }
+    // Complete: straight to the admin queue. A caption edit keeps the
+    // seller's words instead of regenerating the caption.
+    await submitToAdminReview(deps, convo, updated, {
+      status: "SUBMITTED",
+      missing: [],
+      keepCaption: field === "caption",
+    });
   } else {
-    await deps.db.saveListing(listing.id, { status: "NEEDS_INFO", missing: after.missing });
-    setConversationState(convo, "NEEDS_INFO");
-    await persistConvo(deps, convo);
-    const q = nextQuestion(after.missing, convo.lang, updated.photos.length);
-    await sendSafe(deps, convo, sendOpts(q.question, q.quickReplies));
+    // Still incomplete — no follow-up question. The admin sees the missing
+    // fields in review and approves or rejects.
+    await submitToAdminReview(deps, convo, updated, { status: "NEEDS_REVIEW", missing: after.missing });
   }
-}
-
-/**
- * Apply a parsed multi-field dump (see parseDetailsDump) to the listing.
- * Returns false when nothing in the dump coerces (caller falls back to the
- * single-field answer path); otherwise moves the conversation on (CONFIRM
- * when complete, next question when fields are still missing).
- */
-async function applyDetailsDump(
-  deps: Deps,
-  convo: ConversationDoc,
-  listing: ListingDoc,
-  rawText: string,
-  dump: ParsedDetail[],
-): Promise<boolean> {
-  const coerced: Array<{ field: string; value: string | number }> = [];
-  for (const d of dump) {
-    const c = coerceFieldValue(d.field, d.rawValue);
-    if (c.ok) coerced.push({ field: d.field, value: c.value });
-  }
-  if (coerced.length === 0) return false;
-  // The activity bump tells a concurrently-running finalize its extraction
-  // is stale (same reason as handleInfoAnswer above).
-  const nowIso = deps.now();
-  const updated = await deps.db.mutateListing(listing.id, (doc) => {
-    normalizeListing(doc);
-    for (const { field, value } of coerced) applyFieldValue(doc, field, value);
-    const applied = coerced.map((x) => x.field);
-    doc.missing = (doc.missing ?? []).filter((m) => !applied.includes(m));
-    doc.chat_text = appendChat(doc.chat_text ?? "", rawText.trim());
-    return {
-      patch: { extracted: doc.extracted, missing: doc.missing, chat_text: doc.chat_text, caption: doc.caption, last_activity_at: nowIso },
-      result: doc,
-    };
-  });
-  const after = readyForConfirm(updated);
-  if (after.ok) {
-    // A photo that arrived after the last extraction has never been visioned
-    // or moderated — confirming now would publish it unexamined.
-    if (hasUnprocessedPhoto(updated)) {
-      await deferConfirmForPhotoCheck(deps, convo, updated, nowIso);
-      return true;
-    }
-    await moveToConfirm(deps, convo, updated);
-  } else {
-    await deps.db.saveListing(listing.id, { status: "NEEDS_INFO", missing: after.missing });
-    setConversationState(convo, "NEEDS_INFO");
-    await persistConvo(deps, convo);
-    const q = nextQuestion(after.missing, convo.lang, updated.photos.length);
-    await sendSafe(deps, convo, sendOpts(q.question, q.quickReplies));
-  }
-  return true;
-}
-
-/** Build SendMessageOpts without passing explicit `undefined` quickReplies (exactOptionalPropertyTypes). */
-function sendOpts(text: string, quickReplies: QuickReply[] | undefined): SendMessageOpts {
-  return quickReplies ? { text, quickReplies } : { text };
 }
 
 // Re-exported for the finalize worker + tests.
