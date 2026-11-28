@@ -114,6 +114,22 @@ export interface ListingDoc {
    * Absent (old docs) reads as 0.
    */
   inflight_photos?: number | undefined;
+  /**
+   * The "video support nahi hota" notice is sent at most once per listing
+   * (2026-11-28: Nina's forwarded batches each carried a video alongside
+   * 3–6 photos, and the notice repeated after every batch). Absent reads
+   * as false.
+   */
+  video_notice_sent?: boolean | undefined;
+  /**
+   * ISO of the last seller details dump (a text parsing to ≥2 fields) on
+   * this listing. Item boundary (2026-11-28): Nina sent three separate
+   * items minutes apart, each photos + its own details dump, and the
+   * burst-combine merged them into one "bundle" listing. Once a listing
+   * has photos + a details dump, a later photo/dump after a quiet gap
+   * starts the NEXT item instead of joining this one.
+   */
+  details_received_at?: string | null | undefined;
   extracted: ExtractedItem | null;
   missing: string[]; // fields still needed / low confidence
   moderation: ModerationResult | null;
@@ -268,3 +284,22 @@ export type WorkerPayload =
   | FinalizePhotosPayload
   | PublishPayload
   | PollContainerPayload;
+
+/**
+ * Item boundary (2026-11-28): a listing that already holds ≥2 photos and
+ * a details dump is a complete submission. New material arriving after a
+ * quiet gap belongs to the seller's NEXT item — merging it would produce
+ * a "bundle" of separate items (Nina's three items became one listing).
+ * Material inside the gap is still burst-combined into the same listing.
+ */
+export const ITEM_BOUNDARY_GAP_MS = 60_000;
+
+export function isItemBoundary(listing: ListingDoc, nowIso: string): boolean {
+  if (listing.status !== "DRAFT" && listing.status !== "NEEDS_INFO") return false;
+  if (!listing.details_received_at) return false;
+  if ((listing.photos?.length ?? 0) < 2) return false;
+  const detailsMs = Date.parse(listing.details_received_at);
+  const nowMs = Date.parse(nowIso);
+  if (Number.isNaN(detailsMs) || Number.isNaN(nowMs)) return false;
+  return nowMs - detailsMs > ITEM_BOUNDARY_GAP_MS;
+}

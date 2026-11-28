@@ -20,7 +20,7 @@ import { getFirestore, type Firestore } from "firebase-admin/firestore";
 import { FieldValue, Timestamp } from "firebase-admin/firestore";
 import { createHash, randomBytes } from "node:crypto";
 import { getEnv, requireFirebaseEnv, type Env } from "./env";
-import type { AdminSettings, ConversationDoc, DeepPartial, ListingDoc, NormalizedInbound } from "./types";
+import { isItemBoundary, type AdminSettings, type ConversationDoc, type DeepPartial, type ListingDoc, type NormalizedInbound } from "./types";
 
 let app: App | null = null;
 
@@ -266,6 +266,9 @@ export async function getOrCreateActiveListing(
   limitReached?: boolean;
   listingsToday?: number;
   listingsDay?: string;
+  /** Set when an item boundary closed the previous listing: the caller
+   * must enqueue finalize for it so it reaches the admin queue. */
+  closedListing?: { id: string; activity_at: string; photo_at: string };
 }> {
   const convRef = col("conversations").doc(igsid);
   const listingId = newListingId();
@@ -273,11 +276,23 @@ export async function getOrCreateActiveListing(
   return db().runTransaction(async (tx) => {
     const convSnap = await tx.get(convRef);
     const convo = convSnap.exists ? (convSnap.data() as ConversationDoc) : null;
+    let closedListing: { id: string; activity_at: string; photo_at: string } | undefined;
     if (convo?.active_listing_id) {
       const listingSnap = await tx.get(col("listings").doc(convo.active_listing_id));
       const existing = listingSnap.exists ? (listingSnap.data() as ListingDoc) : null;
       if (existing && (existing.status === "DRAFT" || existing.status === "NEEDS_INFO")) {
-        return { listing: existing, isNew: false };
+        if (!isItemBoundary(existing, nowIso)) {
+          return { listing: existing, isNew: false };
+        }
+        // Item boundary: the previous item already has photos + details;
+        // this photo starts the next item. The caller finalizes the old
+        // listing so it lands in the admin queue as its own listing.
+        const activityAt = existing.last_activity_at ?? existing.created_at;
+        closedListing = {
+          id: existing.id,
+          activity_at: activityAt,
+          photo_at: existing.last_photo_at ?? activityAt,
+        };
       }
       if (existing && existing.status === "CONFIRM") {
         // Legacy confirm-pending listing: the seller moved on to a new
@@ -316,7 +331,13 @@ export async function getOrCreateActiveListing(
         ...counterPatch,
       });
     }
-    return { listing: doc, isNew: true, listingsToday: effectiveToday + 1, listingsDay: today };
+    return {
+      listing: doc,
+      isNew: true,
+      listingsToday: effectiveToday + 1,
+      listingsDay: today,
+      ...(closedListing ? { closedListing } : {}),
+    };
   });
 }
 

@@ -6,6 +6,7 @@ import { describe, expect, it } from "vitest";
 import { processIngest, type EnqueueFn, type IngestDeps } from "./ingest";
 import { blankListingDoc, pktDay } from "./db";
 import { blankTestConversation, makeKeyedMutex } from "./test-fakes";
+import { isItemBoundary } from "./types";
 import type {
   ConversationDoc,
   ListingDoc,
@@ -85,10 +86,15 @@ function makeDeps(opts: { maxPerDay?: number } = {}): {
       locks(`conv:${igsid}`, async () => {
         const convoSnap = convs.get(igsid);
         const convo = convoSnap ? structuredClone(convoSnap) : null;
+        let closedListing: { id: string; activity_at: string; photo_at: string } | undefined;
         if (convo?.active_listing_id) {
           const existing = listings.get(convo.active_listing_id);
           if (existing && (existing.status === "DRAFT" || existing.status === "NEEDS_INFO")) {
-            return { listing: existing, isNew: false };
+            if (!isItemBoundary(existing, nowIso)) {
+              return { listing: existing, isNew: false };
+            }
+            const activityAt = existing.last_activity_at ?? existing.created_at;
+            closedListing = { id: existing.id, activity_at: activityAt, photo_at: existing.last_photo_at ?? activityAt };
           }
           if (existing && existing.status === "CONFIRM") {
             existing.status = "SUBMITTED";
@@ -113,7 +119,7 @@ function makeDeps(opts: { maxPerDay?: number } = {}): {
         c.listings_today = effectiveToday + 1;
         c.listings_day = today;
         convs.set(igsid, c);
-        return { listing: doc, isNew: true, listingsToday: effectiveToday + 1, listingsDay: today };
+        return { listing: doc, isNew: true, listingsToday: effectiveToday + 1, listingsDay: today, ...(closedListing ? { closedListing } : {}) };
       }),
     enqueue: (async (route, payload, opts) => {
       enqueued.push({ route, payload, opts });
@@ -179,6 +185,37 @@ describe("processIngest — image", () => {
     expect(listing?.photos[1]?.storage_path).toBe("raw/lst_test123/m_img2-0f0e5934d02300a4.jpg");
     // Two debounce timers armed — the older one self-skips on photo_at mismatch.
     expect(enqueued.filter((e) => e.route === "finalize-photos")).toHaveLength(2);
+  });
+
+  it("item boundary: a photo after photos+details and a quiet gap starts the next item", async () => {
+    const { deps, enqueued, listings, convs } = makeDeps();
+    // Item 1: two photos, then its details dump lands (details_received_at).
+    await processIngest(
+      { kind: "ingest", message: makeInbound("image", "m_i1a", { image_url: "https://cdn.example/1.jpg" }) },
+      deps,
+    );
+    const first = listings.get("lst_test123")!;
+    first.photos.push({ storage_path: "raw/lst_test123/x.jpg", w: 800, h: 1000, phash: "a".repeat(16), received_at: NOW });
+    first.details_received_at = NOW;
+    first.last_activity_at = NOW;
+    first.last_photo_at = NOW;
+
+    // Item 2's first photo arrives 3 minutes later.
+    const later = "2026-09-30T17:08:00.000Z";
+    const res = await processIngest(
+      { kind: "ingest", message: makeInbound("image", "m_i2a", { image_url: "https://cdn.example/2.jpg" }) },
+      { ...deps, nowIso: () => later },
+    );
+
+    expect(res.listingId).not.toBe("lst_test123");
+    expect(listings.get(res.listingId!)?.photos).toHaveLength(1);
+    expect(first.photos).toHaveLength(2); // item 1 untouched
+    expect(convs.get(IGSID)?.active_listing_id).toBe(res.listingId);
+    // The finished item 1 was finalized into the admin queue.
+    const closedFinalize = enqueued.filter(
+      (e) => e.route === "finalize-photos" && e.payload.kind === "finalize-photos" && e.payload.listing_id === "lst_test123" && e.payload.activity_at === NOW,
+    );
+    expect(closedFinalize.length).toBeGreaterThan(0);
   });
 
   it("burst of 3 concurrent photos all land in one listing (2026-11-23: Nina sent 3, only 1 survived)", async () => {

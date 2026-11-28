@@ -171,6 +171,29 @@ describe("handleMessage: guards", () => {
     expect(deps.meta.sent).toHaveLength(1);
     expect(deps.meta.sent[0]!.opts.text).toMatch(/photo|image|tasveer/i);
   });
+
+  it("video notice: once per listing, and never when photos are already in", async () => {
+    const convo = await deps.db.getOrCreateConversation(IGSID);
+    const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
+    listing.status = "DRAFT";
+    await deps.db.createListing(listing);
+    convo.state = "COLLECTING";
+    convo.active_listing_id = "lst_1";
+
+    // First video on a photo-less listing → one notice.
+    await handleMessage(payload("mid_v1"), makeInbound("unsupported", "mid_v1", { unsupported_hint: "video" }), deps);
+    expect(deps.meta.sent).toHaveLength(1);
+    // Second video → no repeat.
+    await handleMessage(payload("mid_v2"), makeInbound("unsupported", "mid_v2", { unsupported_hint: "video" }), deps);
+    expect(deps.meta.sent).toHaveLength(1);
+
+    // Photos land; a later video in the same burst → still no notice.
+    const stored = deps.fdb.listings.get("lst_1")!;
+    stored.photos.push(makePhoto("sellers/x/0.jpg"));
+    stored.video_notice_sent = false;
+    await handleMessage(payload("mid_v3"), makeInbound("unsupported", "mid_v3", { unsupported_hint: "video" }), deps);
+    expect(deps.meta.sent).toHaveLength(1);
+  });
 });
 
 describe("handleMessage: 24h window", () => {
@@ -357,6 +380,38 @@ describe("handleMessage: NEEDS_INFO typed answers", () => {
     expect(updated.status).toBe("NEEDS_INFO");
     expect(deps.fdb.convos.get(IGSID)!.state).toBe("NEEDS_INFO");
     expect(deps.enqueued.filter((e) => e.route === "finalize-photos").length).toBeGreaterThan(0);
+  });
+
+  it("item boundary: a fresh details dump after the gap starts the next item", async () => {
+    const convo = await deps.db.getOrCreateConversation(IGSID);
+    const listing = deps.db.blankListingDoc("lst_1", IGSID, NOW);
+    listing.status = "DRAFT";
+    listing.photos = [makePhoto("sellers/x/0.jpg"), makePhoto("sellers/x/1.jpg")];
+    listing.chat_text = "Brand: Nishat\nPrice: 3500\nCity: Lahore";
+    listing.details_received_at = "2026-09-30T17:02:00.000Z"; // 3 min before NOW
+    listing.last_activity_at = "2026-09-30T17:02:00.000Z";
+    listing.last_photo_at = "2026-09-30T17:02:00.000Z";
+    await deps.db.createListing(listing);
+    convo.state = "COLLECTING";
+    convo.active_listing_id = "lst_1";
+
+    await handleMessage(
+      payload("mid_b"),
+      makeInbound("text", "mid_b", { text: "Brand: Sapphire\nSize: M\nPrice: 2500\nCity: Lahore" }),
+      deps,
+    );
+
+    const after = deps.fdb.convos.get(IGSID)!;
+    expect(after.active_listing_id).not.toBe("lst_1");
+    const fresh = deps.fdb.listings.get(after.active_listing_id!)!;
+    expect(fresh.chat_text).toMatch(/Sapphire/);
+    expect(deps.fdb.listings.get("lst_1")!.chat_text).not.toMatch(/Sapphire/);
+    // The finished item was finalized toward the admin queue.
+    expect(
+      deps.enqueued.some(
+        (e) => e.route === "finalize-photos" && e.payload.kind === "finalize-photos" && e.payload.listing_id === "lst_1",
+      ),
+    ).toBe(true);
   });
 });
 

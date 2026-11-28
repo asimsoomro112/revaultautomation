@@ -129,6 +129,7 @@ export interface IngestDeps {
     limitReached?: boolean;
     listingsToday?: number;
     listingsDay?: string;
+    closedListing?: { id: string; activity_at: string; photo_at: string };
   }>;
   enqueue: EnqueueFn;
   getPhotoDebounceSeconds: () => number;
@@ -177,7 +178,21 @@ async function handleImage(
   // listing (null + limitReached) — the photo is dropped, never downloaded,
   // and the message worker sends the polite limit reply so the seller hears
   // why. Reusing an existing active listing never consumes a slot.
-  const { listing } = await deps.getOrCreateActiveListing(igsid, now, deps.getMaxListingsPerSellerPerDay());
+  const { listing, closedListing } = await deps.getOrCreateActiveListing(igsid, now, deps.getMaxListingsPerSellerPerDay());
+  if (closedListing) {
+    // Item boundary: the previous item is complete (photos + details) —
+    // finalize it into the admin queue as its own listing.
+    await deps.enqueue(
+      "finalize-photos",
+      {
+        kind: "finalize-photos",
+        listing_id: closedListing.id,
+        photo_at: closedListing.photo_at,
+        activity_at: closedListing.activity_at,
+      },
+      { deduplicationId: `finalize-${closedListing.id}-${closedListing.activity_at}` },
+    );
+  }
   if (!listing) {
     log.info("ingest: daily listing limit reached — photo dropped, limit reply enqueued", { mid: message.mid });
     // Persist the inbound first: the message route skips payloads whose

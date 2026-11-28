@@ -4,7 +4,7 @@
  * no live claim lease, and no recent worker activity.
  */
 import { describe, expect, it } from "vitest";
-import { hasLiveClaimLease, reconcileDecision, STUCK_AFTER_MS } from "./reconcile";
+import { hasLiveClaimLease, reconcileDecision, strandedDecision, STUCK_AFTER_MS } from "./reconcile";
 
 const NOW = Date.parse("2026-11-26T09:00:00.000Z");
 const OLD = new Date(NOW - STUCK_AFTER_MS - 3600_000).toISOString();
@@ -70,5 +70,27 @@ describe("reconcileDecision", () => {
   it("skips when the listing is no longer PUBLISHING (concurrent move wins)", () => {
     expect(reconcileDecision(input({ status: "REJECTED" }), NOW)).toBe("skip-not-publishing");
     expect(reconcileDecision(input({ status: "PUBLISHED" }), NOW)).toBe("skip-not-publishing");
+  });
+});
+
+describe("strandedDecision (2026-11-28 sweep)", () => {
+  const STALE = new Date(NOW - 2 * 3600_000).toISOString();
+  const FRESH = new Date(NOW - 60_000).toISOString();
+  const base = { status: "CONFIRM", photoCount: 3, lastActivity: STALE, created_at: STALE };
+
+  it("submits a stale CONFIRM listing to the admin queue", () => {
+    expect(strandedDecision(base, NOW)).toBe("submit-confirm");
+  });
+
+  it("re-runs finalize for stale NEEDS_INFO / DRAFT listings with photos", () => {
+    expect(strandedDecision({ ...base, status: "NEEDS_INFO" }, NOW)).toBe("enqueue-finalize");
+    expect(strandedDecision({ ...base, status: "DRAFT" }, NOW)).toBe("enqueue-finalize");
+  });
+
+  it("skips fresh listings, photo-less drafts, and other statuses", () => {
+    expect(strandedDecision({ ...base, lastActivity: FRESH }, NOW)).toBe("skip");
+    expect(strandedDecision({ ...base, status: "DRAFT", photoCount: 0 }, NOW)).toBe("skip");
+    expect(strandedDecision({ ...base, status: "SUBMITTED" }, NOW)).toBe("skip");
+    expect(strandedDecision({ ...base, status: "NEEDS_REVIEW" }, NOW)).toBe("skip");
   });
 });

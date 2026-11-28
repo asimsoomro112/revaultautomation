@@ -30,7 +30,15 @@ import { isCronAuthorized } from "@/lib/cron-auth";
 import { adminDb, appendListingEvent } from "@/lib/firebase-admin";
 import { log } from "@/lib/log";
 import { enqueuePublishWorker } from "@/lib/publish-queue";
-import { reconcileDecision, STUCK_AFTER_MS, type ReconcileDecision } from "@/lib/reconcile";
+import { enqueueWorker } from "@/lib/qstash";
+import {
+  reconcileDecision,
+  strandedDecision,
+  STUCK_AFTER_MS,
+  STRANDED_AFTER_MS,
+  type ReconcileDecision,
+  type StrandedDecision,
+} from "@/lib/reconcile";
 import { notifyAdmin } from "@/lib/telegram";
 import type { ListingDoc } from "@/lib/types";
 
@@ -113,6 +121,80 @@ export async function GET(req: NextRequest) {
     }
   }
 
+  // --- Stranded-listing sweep (2026-11-28) ---------------------------------
+  // Listings the seller flow left in CONFIRM / NEEDS_INFO / DRAFT never
+  // reach /admin (the queue lists review/publish statuses only). After an
+  // hour of seller silence, hand them to the admin: CONFIRM → SUBMITTED,
+  // NEEDS_INFO/DRAFT with photos → finalize re-run (it routes SUBMITTED
+  // or NEEDS_REVIEW from everything received).
+  const strandedBefore = new Date(now.getTime() - STRANDED_AFTER_MS).toISOString();
+  const sweptSubmitted: string[] = [];
+  const sweptFinalize: string[] = [];
+  for (const status of ["CONFIRM", "NEEDS_INFO", "DRAFT"] as const) {
+    const sSnap = await adminDb()
+      .collection("listings")
+      .where("status", "==", status)
+      .where("created_at", "<", strandedBefore)
+      .get();
+    for (const doc of sSnap.docs) {
+      const outcome = await adminDb().runTransaction<{
+        decision: StrandedDecision;
+        activityAt: string;
+        photoAt: string;
+      }>(async (tx) => {
+        const freshSnap = await tx.get(doc.ref);
+        if (!freshSnap.exists) return { decision: "skip", activityAt: "", photoAt: "" };
+        const fresh = freshSnap.data() as ListingDoc;
+        const decision = strandedDecision(
+          {
+            status: fresh.status,
+            photoCount: fresh.photos?.length ?? 0,
+            lastActivity: fresh.last_activity_at,
+            created_at: fresh.created_at,
+          },
+          now.getTime(),
+        );
+        if (decision === "submit-confirm") {
+          tx.update(doc.ref, { status: "SUBMITTED" });
+          const convoRef = adminDb().collection("conversations").doc(fresh.seller_igsid);
+          const convoSnap = await tx.get(convoRef);
+          if (convoSnap.exists && convoSnap.data()?.active_listing_id === doc.id) {
+            tx.update(convoRef, { state: "IDLE", active_listing_id: null });
+          }
+        }
+        const activityAt = fresh.last_activity_at ?? fresh.created_at;
+        return { decision, activityAt, photoAt: fresh.last_photo_at ?? activityAt };
+      });
+      if (outcome.decision === "submit-confirm") {
+        await appendListingEvent(doc.id, "submitted", {
+          detail: "Reconcile sweep: stranded CONFIRM → SUBMITTED for admin review",
+        });
+        sweptSubmitted.push(doc.id);
+        log.info("cron/reconcile: stranded CONFIRM submitted", { listing: doc.id });
+      } else if (outcome.decision === "enqueue-finalize") {
+        try {
+          await enqueueWorker(
+            "finalize-photos",
+            {
+              kind: "finalize-photos",
+              listing_id: doc.id,
+              photo_at: outcome.photoAt,
+              activity_at: outcome.activityAt,
+            },
+            { deduplicationId: `finalize-sweep-${doc.id}-${outcome.activityAt}` },
+          );
+          sweptFinalize.push(doc.id);
+          log.info("cron/reconcile: stranded listing finalize re-armed", { listing: doc.id });
+        } catch (err) {
+          log.warn("cron/reconcile: stranded finalize enqueue failed", {
+            listing: doc.id,
+            error: err instanceof Error ? err.message.slice(0, 160) : String(err),
+          });
+        }
+      }
+    }
+  }
+
   if (recovered.length > 0) {
     await notifyAdmin(
       `🔧 Reconcile: ${recovered.length} listing(s) stuck in PUBLISHING > 2h were marked FAILED (retry from /admin):\n${recovered.join("\n")}`,
@@ -126,6 +208,8 @@ export async function GET(req: NextRequest) {
     live_media: liveMedia,
     recovery_enqueued: recoveryEnqueued,
     skipped_lease: skippedLease,
+    swept_submitted: sweptSubmitted,
+    swept_finalize: sweptFinalize,
     note: "DM-vs-webhook diff skipped: Conversations API read needs extra scopes (documented limitation).",
   });
 }

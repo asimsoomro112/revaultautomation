@@ -3,6 +3,7 @@
  * Not a test file itself — vitest only collects *.test.ts.
  */
 import { blankListingDoc, pktDay } from "./db";
+import { isItemBoundary } from "./types";
 import type { Deps } from "./conversation";
 import type { FinalizeDeps } from "./finalize";
 import type { GeminiClient, IntentResult, VisionResult } from "./gemini";
@@ -304,10 +305,15 @@ export function makeFakeDeps(overrides: Partial<FakeDb> = {}): FakeDeps {
         locks(`conv:${igsid}`, async () => {
           const convoSnap = fdb.convos.get(igsid);
           const convo = convoSnap ? structuredClone(convoSnap) : null;
+          let closedListing: { id: string; activity_at: string; photo_at: string } | undefined;
           if (convo?.active_listing_id) {
             const existing = fdb.listings.get(convo.active_listing_id);
             if (existing && (existing.status === "DRAFT" || existing.status === "NEEDS_INFO")) {
-              return { listing: existing, isNew: false };
+              if (!isItemBoundary(existing, nowIso)) {
+                return { listing: existing, isNew: false };
+              }
+              const activityAt = existing.last_activity_at ?? existing.created_at;
+              closedListing = { id: existing.id, activity_at: activityAt, photo_at: existing.last_photo_at ?? activityAt };
             }
             if (existing && existing.status === "CONFIRM") {
               existing.status = "SUBMITTED";
@@ -335,7 +341,7 @@ export function makeFakeDeps(overrides: Partial<FakeDb> = {}): FakeDeps {
           c.listings_today = effectiveToday + 1;
           c.listings_day = today;
           fdb.convos.set(igsid, c);
-          return { listing: doc, isNew: true, listingsToday: effectiveToday + 1, listingsDay: today };
+          return { listing: doc, isNew: true, listingsToday: effectiveToday + 1, listingsDay: today, ...(closedListing ? { closedListing } : {}) };
         }),
       createListing: async (doc: ListingDoc) => {
         fdb.listings.set(doc.id, doc);

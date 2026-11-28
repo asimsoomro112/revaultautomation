@@ -57,3 +57,31 @@ export function reconcileDecision(input: ReconcileInput, nowMs: number): Reconci
   }
   return "fail";
 }
+
+/**
+ * Stranded-listing sweep (2026-11-28): a listing the seller flow left in
+ * CONFIRM (never tapped Post), NEEDS_INFO (never answered) or DRAFT (a
+ * finalize that never fired) is invisible in /admin — the queue only
+ * lists review/publish statuses. Once the seller has been quiet for an
+ * hour, hand it to the admin instead of stranding it:
+ *  - CONFIRM is complete by construction → SUBMITTED.
+ *  - NEEDS_INFO / DRAFT with photos → re-run finalize, which extracts
+ *    from everything received and routes SUBMITTED or NEEDS_REVIEW.
+ *  - DRAFT with no photos has nothing to review → skip (retention's job).
+ */
+export const STRANDED_AFTER_MS = 3600 * 1000;
+
+export type StrandedDecision = "submit-confirm" | "enqueue-finalize" | "skip";
+
+export function strandedDecision(
+  input: { status: string; photoCount: number; lastActivity: string | null; created_at: string },
+  nowMs: number,
+): StrandedDecision {
+  if (input.status !== "CONFIRM" && input.status !== "NEEDS_INFO" && input.status !== "DRAFT") {
+    return "skip";
+  }
+  const anchorMs = Date.parse(input.lastActivity ?? input.created_at);
+  if (Number.isNaN(anchorMs) || anchorMs >= nowMs - STRANDED_AFTER_MS) return "skip";
+  if (input.status === "CONFIRM") return "submit-confirm";
+  return input.photoCount > 0 ? "enqueue-finalize" : "skip";
+}

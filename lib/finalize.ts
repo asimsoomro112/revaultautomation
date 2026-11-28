@@ -23,6 +23,7 @@ import { applyModeration } from "./moderation";
 import { dhash } from "./dhash";
 import {
   readyForConfirm,
+  releaseConversationIfActive,
   sendSafe,
   setConversationState,
   submitToAdminReview,
@@ -69,17 +70,7 @@ async function markNeedsReview(
   await deps.db.saveListing(listing.id, { status: "NEEDS_REVIEW" });
   listing.status = "NEEDS_REVIEW";
   await deps.db.appendListingEvent(listing.id, { type: "needs_review", note: note.slice(0, 300) });
-  setConversationState(convo, "IDLE");
-  convo.active_listing_id = null;
-  // Narrow patch of only the fields finalize owns: the convo was read
-  // before the vision call, so a full-doc save would clobber a seller
-  // message that arrived during extraction (last_user_msg_at, state,
-  // window_open). saveConversation is merge-based, so a partial patch
-  // only touches these two fields.
-  await deps.db.saveConversation(convo.igsid, {
-    state: convo.state,
-    active_listing_id: null,
-  });
+  await releaseConversationIfActive(deps, convo, listing.id);
   await deps.notifyAdmin(`🔍 Review needed — listing ${listing.id} (seller ${listing.seller_igsid}): ${note.slice(0, 200)}`, {
     listingId: listing.id,
     igsid: listing.seller_igsid,

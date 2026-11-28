@@ -10,6 +10,7 @@
  *
  * Dialogue states: IDLE → COLLECTING → NEEDS_INFO → CONFIRM → (submit/cancel) → IDLE.
  */
+import { isItemBoundary } from "./types";
 import type {
   AdminSettings,
   Condition,
@@ -433,6 +434,7 @@ export interface DbPort {
     limitReached?: boolean;
     listingsToday?: number;
     listingsDay?: string;
+    closedListing?: { id: string; activity_at: string; photo_at: string };
   }>;
   createListing(doc: ListingDoc): Promise<void>;
   appendListingEvent(listingId: string, event: { type: string; at?: string; [k: string]: unknown }): Promise<void>;
@@ -611,6 +613,24 @@ export async function moveToConfirm(deps: Deps, convo: ConversationDoc, listing:
  * is released (IDLE, no active listing) so the customer's next post starts
  * a fresh listing instead of being folded into this one.
  */
+/**
+ * Release the conversation only if it still points at this listing. With
+ * item-boundary splits, the seller may already be collecting the next
+ * item while this listing finalizes — clearing the pointer then would
+ * orphan the new item.
+ */
+export async function releaseConversationIfActive(
+  deps: Deps,
+  convo: ConversationDoc,
+  listingId: string,
+): Promise<void> {
+  const fresh = await deps.db.getOrCreateConversation(convo.igsid);
+  if (fresh.active_listing_id !== listingId) return;
+  setConversationState(convo, "IDLE");
+  convo.active_listing_id = null;
+  await deps.db.saveConversation(convo.igsid, { state: convo.state, active_listing_id: null });
+}
+
 export async function submitToAdminReview(
   deps: Deps,
   convo: ConversationDoc,
@@ -637,12 +657,7 @@ export async function submitToAdminReview(
   } else {
     await deps.db.appendListingEvent(listing.id, { type: "submitted", caption_chars: caption.length });
   }
-  setConversationState(convo, "IDLE");
-  convo.active_listing_id = null;
-  // Narrow patch of only the fields this transition owns (the finalize
-  // worker's convo snapshot predates the vision call — a full save would
-  // clobber a seller message that arrived during extraction).
-  await deps.db.saveConversation(convo.igsid, { state: convo.state, active_listing_id: null });
+  await releaseConversationIfActive(deps, convo, listing.id);
   if (opts.status === "NEEDS_REVIEW") {
     await deps.notifyAdmin(
       `🔍 Review needed — listing ${listing.id} (seller ${listing.seller_igsid}): missing ${opts.missing.join(", ") || "none"}`,
@@ -679,6 +694,25 @@ function appendChat(existing: string, text: string): string {
  * The caller already bumped last_activity_at in the same mutate, so a
  * finalize that started before this text skips itself on the activity guard.
  */
+/**
+ * Item boundary for texts: a fresh details dump arriving after the quiet
+ * gap on a listing that already has photos + details starts the NEXT
+ * item. The finished listing is finalized into the admin queue and the
+ * dump lands on a fresh listing.
+ */
+async function splitItemIfBoundary(
+  deps: Deps,
+  convo: ConversationDoc,
+  listing: ListingDoc,
+  text: string,
+  nowIso: string,
+): Promise<ListingDoc> {
+  if (parseDetailsDump(text).length < 2 || !isItemBoundary(listing, nowIso)) return listing;
+  const ensured = await ensureActiveListing(deps, convo, nowIso);
+  if (ensured.listing && ensured.listing.id !== listing.id) setConversationState(convo, "COLLECTING");
+  return ensured.listing ?? listing;
+}
+
 async function rearmFinalizeForText(deps: Deps, listing: ListingDoc, nowIso: string): Promise<void> {
   // Re-read fresh: callers pass a snapshot read BEFORE their own
   // last_activity_at bump, so a photo appended between that read and this
@@ -722,21 +756,39 @@ export async function ensureActiveListing(
   if (convo.active_listing_id) {
     const existing = await activeListing(deps, convo);
     if (existing && (existing.status === "DRAFT" || existing.status === "NEEDS_INFO" || existing.status === "CONFIRM")) {
-      if (convo.state === "IDLE") setConversationState(convo, "COLLECTING");
-      return { listing: existing, isNew: false };
+      if (!isItemBoundary(existing, nowIso)) {
+        if (convo.state === "IDLE") setConversationState(convo, "COLLECTING");
+        return { listing: existing, isNew: false };
+      }
+      // Item boundary: fall through — getOrCreate closes the finished
+      // item and starts the next one. The pointer stays set so the
+      // transaction can see (and close) the finished listing.
+    } else {
+      convo.active_listing_id = null; // stale pointer (submitted/rejected/…)
     }
-    convo.active_listing_id = null; // stale pointer (submitted/rejected/…)
   }
   // The daily limit (incl. the midnight-PKT rollover) is enforced atomically
   // inside getOrCreateActiveListing's transaction — it used to live here,
   // which left the photo-first path unenforced: ingest called getOrCreate
   // directly and never touched listings_today, so a photo-first seller could
   // submit unlimited listings (2026-11-24 re-audit Lane C N-H1).
-  const { listing, isNew, listingsToday, listingsDay } = await deps.db.getOrCreateActiveListing(
+  const { listing, isNew, listingsToday, listingsDay, closedListing } = await deps.db.getOrCreateActiveListing(
     convo.igsid,
     nowIso,
     deps.maxListingsPerSellerPerDay,
   );
+  if (closedListing) {
+    await deps.enqueueWorker(
+      "finalize-photos",
+      {
+        kind: "finalize-photos",
+        listing_id: closedListing.id,
+        photo_at: closedListing.photo_at,
+        activity_at: closedListing.activity_at,
+      },
+      { deduplicationId: `finalize-${closedListing.id}-${closedListing.activity_at}` },
+    );
+  }
   if (!listing) return { listing: null, isNew: false }; // limit reached — caller sends the limit reply
   convo.active_listing_id = listing.id;
   convo.intent = "SELLER_SUBMIT";
@@ -848,7 +900,24 @@ export async function handleMessage(
       await handleText(deps, convo, text, nowIso);
     } else if (inbound.kind === "unsupported") {
       await persistConvo(deps, convo);
-      await sendSafe(deps, convo, { text: unsupportedReply(inbound.unsupported_hint ?? "", convo.lang) });
+      // At most one video notice per listing, and none when photos are
+      // already in — a forwarded batch's video must not re-trigger the
+      // "2+ clear photos chahiye" line after every batch (2026-11-28).
+      const listing = await activeListing(deps, convo);
+      let sendNotice = true;
+      if (listing) {
+        if (listing.photos.length > 0) {
+          sendNotice = false;
+        } else {
+          sendNotice = await deps.db.mutateListing(listing.id, (doc) => {
+            const first = !doc.video_notice_sent;
+            return { patch: { video_notice_sent: true }, result: first };
+          });
+        }
+      }
+      if (sendNotice) {
+        await sendSafe(deps, convo, { text: unsupportedReply(inbound.unsupported_hint ?? "", convo.lang) });
+      }
     } else {
       log.info("message.unhandled_kind", { kind: inbound.kind, mid });
     }
@@ -918,11 +987,19 @@ async function handleText(deps: Deps, convo: ConversationDoc, text: string, nowI
       // process concurrently, and neither may clobber the other. The
       // activity bump + finalize re-arm are the burst-combine: this text
       // joins the pending extraction instead of arriving too late for it.
-      await deps.db.mutateListing(listing.id, (doc) => ({
-        patch: { chat_text: appendChat(doc.chat_text ?? "", text), last_activity_at: nowIso },
+      // A fresh details dump after the item-boundary gap instead starts
+      // the next item (the finished one is finalized to the admin queue).
+      const target = await splitItemIfBoundary(deps, convo, listing, text, nowIso);
+      const isDump = parseDetailsDump(text).length >= 2;
+      await deps.db.mutateListing(target.id, (doc) => ({
+        patch: {
+          chat_text: appendChat(doc.chat_text ?? "", text),
+          last_activity_at: nowIso,
+          ...(isDump ? { details_received_at: nowIso } : {}),
+        },
         result: undefined,
       }));
-      await rearmFinalizeForText(deps, listing, nowIso);
+      await rearmFinalizeForText(deps, target, nowIso);
       await persistConvo(deps, convo);
       await sendSafe(deps, convo, { text: collectingAck(convo.lang) });
       break;
@@ -946,11 +1023,17 @@ async function handleText(deps: Deps, convo: ConversationDoc, text: string, nowI
         await handleInfoAnswer(deps, convo, listing, "caption", text);
         break;
       }
-      await deps.db.mutateListing(listing.id, (doc) => ({
-        patch: { chat_text: appendChat(doc.chat_text ?? "", text), last_activity_at: nowIso },
+      const target = await splitItemIfBoundary(deps, convo, listing, text, nowIso);
+      const isDump = parseDetailsDump(text).length >= 2;
+      await deps.db.mutateListing(target.id, (doc) => ({
+        patch: {
+          chat_text: appendChat(doc.chat_text ?? "", text),
+          last_activity_at: nowIso,
+          ...(isDump ? { details_received_at: nowIso } : {}),
+        },
         result: undefined,
       }));
-      await rearmFinalizeForText(deps, listing, nowIso);
+      await rearmFinalizeForText(deps, target, nowIso);
       await persistConvo(deps, convo);
       await sendSafe(deps, convo, { text: collectingAck(convo.lang) });
       break;
